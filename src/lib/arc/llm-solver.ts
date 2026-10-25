@@ -57,22 +57,11 @@ export async function solveWithLlm(train: Pair[], testInput: Grid, samples = 2, 
   const predictions: Grid[] = [];
   let note: string | undefined;
   try {
-    const { default: ZAI } = await import('z-ai-web-dev-sdk');
-    const zai = await ZAI.create();
+    const { llmChat } = await import('@/lib/server/llm');
     const prompt = pairsToPrompt(train, testInput);
     for (let i = 0; i < samples; i++) {
       try {
-        const completion = (await Promise.race([
-          zai.chat.completions.create({
-            messages: [
-              { role: 'assistant', content: SYSTEM },
-              { role: 'user', content: prompt },
-            ],
-            thinking: { type: 'disabled' },
-          }),
-          new Promise<never>((_, rej) => setTimeout(() => rej(new Error('llm-timeout')), timeoutMs)),
-        ])) as { choices?: Array<{ message?: { content?: string } }> };
-        const text = completion.choices?.[0]?.message?.content ?? '';
+        const text = await llmChat(SYSTEM, prompt, timeoutMs);
         const grid = parseGrid(text);
         if (grid && !predictions.some((p) => JSON.stringify(p) === JSON.stringify(grid))) {
           predictions.push(grid);

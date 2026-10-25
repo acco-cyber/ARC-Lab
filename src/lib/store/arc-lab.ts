@@ -8,7 +8,7 @@
 
 import { create } from 'zustand';
 
-export type TabId = 'home' | 'academy' | 'workbench' | 'arena' | 'guide';
+export type TabId = 'home' | 'academy' | 'workbench' | 'arena' | 'agent' | 'guide';
 
 export interface ProgressLevel {
   puzzleId: string;

@@ -6,7 +6,7 @@
  */
 
 import React from 'react';
-import { GraduationCap, Home, Microscope, Swords, BookOpen, Sparkles, Flame, Layers } from 'lucide-react';
+import { GraduationCap, Home, Microscope, Swords, BookOpen, Sparkles, Flame, Layers, Bot } from 'lucide-react';
 import { useArcLab, type TabId } from '@/lib/store/arc-lab';
 import { usePlayerId, useProgress } from './providers';
 import { Button } from '@/components/ui/button';
@@ -24,6 +24,9 @@ const WorkbenchView = dynamic(() => import('@/components/workbench/workbench-vie
 const ArenaView = dynamic(() => import('@/components/arena/arena-view'), {
   loading: () => <SectionLoader label="Loading Arena…" />,
 });
+const AgentLab = dynamic(() => import('@/components/agent/agent-lab'), {
+  loading: () => <SectionLoader label="Loading Agent Lab…" />,
+});
 
 function SectionLoader({ label }: { label: string }) {
   return (
@@ -38,6 +41,7 @@ const TABS: Array<{ id: TabId; label: string; icon: React.ReactNode }> = [
   { id: 'home', label: 'Home', icon: <Home className="h-4 w-4" /> },
   { id: 'academy', label: 'Academy', icon: <GraduationCap className="h-4 w-4" /> },
   { id: 'workbench', label: 'Workbench', icon: <Microscope className="h-4 w-4" /> },
+  { id: 'agent', label: 'Agent Lab', icon: <Bot className="h-4 w-4" /> },
   { id: 'arena', label: 'Arena', icon: <Swords className="h-4 w-4" /> },
   { id: 'guide', label: 'Guide', icon: <BookOpen className="h-4 w-4" /> },
 ];
@@ -142,6 +146,7 @@ export default function AppShell() {
         {tab === 'home' && <HomeView />}
         {tab === 'academy' && <AcademyView />}
         {tab === 'workbench' && <WorkbenchView />}
+        {tab === 'agent' && <AgentLab />}
         {tab === 'arena' && <ArenaView />}
         {tab === 'guide' && <GuideView />}
       </main>
@@ -190,23 +195,24 @@ function HomeView() {
         />
         <div className="relative max-w-3xl space-y-4">
           <Badge variant="outline" className="gap-1 border-amber-500/50 text-amber-600 dark:text-amber-400">
-            <Sparkles className="h-3 w-3" /> 100 levels · 7 solvers · 1 shared reasoning core
+            <Sparkles className="h-3 w-3" /> 100 levels · 7 solvers · AI agents that play · 1 shared reasoning core
           </Badge>
           <h1 className="text-3xl font-extrabold tracking-tight sm:text-5xl">
-            Learn to reason. <span className="text-emerald-500">Debug the reasoning.</span> Benchmark it.
+            Learn to reason. <span className="text-emerald-500">Watch agents reason.</span> Benchmark it.
           </h1>
           <p className="text-sm text-muted-foreground sm:text-base">
             ARC Lab is an interactive laboratory for the Abstraction and Reasoning Corpus. Solve grid puzzles level by level in the{' '}
             <strong className="text-foreground">Academy</strong>, inspect and build transformation programs in the{' '}
-            <strong className="text-foreground">Workbench</strong>, and run reproducible solver evaluations in the{' '}
+            <strong className="text-foreground">Workbench</strong>, watch AI agents play the game in the{' '}
+            <strong className="text-foreground">Agent Lab</strong>, and run reproducible solver evaluations in the{' '}
             <strong className="text-foreground">Arena</strong> — all on one shared ARC core.
           </p>
           <div className="flex flex-wrap gap-2 pt-2">
             <Button size="lg" onClick={() => setTab('academy')} className="gap-2">
               Start solving <ArrowRight className="h-4 w-4" aria-hidden />
             </Button>
-            <Button size="lg" variant="outline" onClick={() => setTab('workbench')}>
-              Open the Workbench
+            <Button size="lg" variant="outline" onClick={() => setTab('agent')} className="gap-2">
+              <Bot className="h-4 w-4" aria-hidden /> Watch an agent play
             </Button>
             <Button size="lg" variant="outline" onClick={() => setTab('arena')}>
               Run the Arena
@@ -220,7 +226,7 @@ function HomeView() {
         </div>
       </section>
 
-      <section className="grid gap-4 md:grid-cols-3" aria-label="The three experiences">
+      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4" aria-label="The four experiences">
         <ExperienceCard
           emoji="🎓"
           title="ARC Academy"
@@ -238,6 +244,14 @@ function HomeView() {
           onClick={() => setTab('workbench')}
         />
         <ExperienceCard
+          emoji="🤖"
+          title="Agent Lab"
+          subtitle="Watch AI agents play the game"
+          body="Pick a puzzle and watch built-in heuristics, the real acco-cyber/ARC-AGI-2 symbolic engine, or LLM program-synthesizers reason through it step by step. Plug in your own agent as JS or an HTTP endpoint, and batch-test with honest metrics."
+          cta="Open the Agent Lab"
+          onClick={() => setTab('agent')}
+        />
+        <ExperienceCard
           emoji="⚔️"
           title="ARC Arena"
           subtitle="The reproducible evaluation platform"
@@ -250,8 +264,9 @@ function HomeView() {
       <section className="rounded-xl border bg-card p-5 text-sm text-muted-foreground" aria-label="Integration statement">
         <p className="font-semibold text-foreground">One integrated workflow</p>
         <p className="mt-1">
-          Solve a puzzle by hand in the Academy → open the same task in the Workbench and build the rule as a program → run symbolic, search and LLM
-          solvers on it in the Arena → compare your human trace with the machines'. Every puzzle is inspectable and every experiment is exportable.
+          Solve a puzzle by hand in the Academy → open the same task in the Workbench and build the rule as a program → send it to the Agent Lab and watch
+          machines attempt it — including your own solver → run full evaluations in the Arena → compare your human trace with the agents'. Every puzzle is
+          inspectable and every experiment is exportable.
         </p>
       </section>
     </div>
@@ -289,9 +304,9 @@ function GuideView() {
     <div className="mx-auto max-w-3xl space-y-6">
       <div>
         <h1 className="text-2xl font-extrabold tracking-tight">ARC Lab Guide</h1>
-        <p className="mt-1 text-sm text-muted-foreground">How the three experiences fit together, how to import ARC data, and how the evaluation is scored.</p>
+        <p className="mt-1 text-sm text-muted-foreground">How the four experiences fit together, how to import ARC data, how agents plug in, and how the evaluation is scored.</p>
       </div>
-      <Accordion type="multiple" defaultValue={['what', 'academy', 'workbench', 'arena', 'data', 'schema']}>
+      <Accordion type="multiple" defaultValue={['what', 'academy', 'workbench', 'agent', 'arena', 'data', 'schema']}>
         <AccordionItem value="what">
           <AccordionTrigger>What is ARC?</AccordionTrigger>
           <AccordionContent className="space-y-2 text-sm text-muted-foreground">
@@ -338,6 +353,19 @@ function GuideView() {
               <li><strong className="text-foreground">Runtime</strong> — wall-clock per task; efficiency is a first-class measurement.</li>
               <li><strong className="text-foreground">Failure taxonomy</strong> — no-prediction / shape-mismatch / color-mismatch / cell-errors.</li>
               <li>Runs persist with dataset version, solver set, scope and timestamp, and can be exported as reproducible JSON manifests.</li>
+            </ul>
+          </AccordionContent>
+        </AccordionItem>
+        <AccordionItem value="agent">
+          <AccordionTrigger>What can agents do in the Agent Lab?</AccordionTrigger>
+          <AccordionContent className="space-y-2 text-sm text-muted-foreground">
+            <ul className="list-disc space-y-1 pl-4">
+              <li><strong className="text-foreground">Watch agents play</strong> — pick any puzzle and an agent, then watch its reasoning trace and the answer being painted cell by cell, followed by honest scoring (exact match, pass@2, pixel accuracy).</li>
+              <li><strong className="text-foreground">arc-jepa engine</strong> — the real symbolic solver from acco-cyber/ARC-AGI-2 runs inside ARC Lab (induction → DSL beam search → repair → A* → evolution), so you can test the exact code from that repository.</li>
+              <li><strong className="text-foreground">APEX-style synthesizer</strong> — replicates the Phase-B methodology of that repo: the LLM writes programs, each program must reproduce every example exactly, with repair rounds and a direct-grid fallback.</li>
+              <li><strong className="text-foreground">Plug in your own agent</strong> — paste a JavaScript solver (sandboxed in a Web Worker, auto-verified on the examples) or point at an HTTP endpoint that implements your own backend.</li>
+              <li><strong className="text-foreground">Batch tests</strong> — run any agent over a deterministic curriculum sample and read the summary (solved, pass@2, pixel accuracy, runtime).</li>
+              <li>Agents never see the expected test output before predicting — the same rule as the Arena.</li>
             </ul>
           </AccordionContent>
         </AccordionItem>
