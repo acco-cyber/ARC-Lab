@@ -4,9 +4,9 @@
 FROM oven/bun:1 AS base
 WORKDIR /app
 
-# Python engine deps (arcjepa symbolic mode needs python3 + numpy only)
+# Python engine deps (arcjepa symbolic mode + Notebook Agent toolkits need python3 + numpy/scipy)
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip \
-    && pip3 install --break-system-packages --no-cache-dir numpy \
+    && pip3 install --break-system-packages --no-cache-dir numpy scipy \
     && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies first (better layer caching)

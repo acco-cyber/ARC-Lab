@@ -10,12 +10,14 @@
  */
 
 import React from 'react';
-import { Bot, FlaskConical, Loader2, Play, Sparkles, Trophy, Upload } from 'lucide-react';
+import { Bot, FlaskConical, Loader2, Play, RefreshCw, Shuffle, Sparkles, Trophy, Upload } from 'lucide-react';
 import { AGENTS, getAgent, loadAgentScores, saveAgentScore, type AgentScoreEntry } from '@/lib/arc/agents';
 import { LEVELS, levelTask, WORLDS } from '@/lib/arc/curriculum';
 import { validateArcJson, type Task } from '@/lib/arc/types';
 import { useArcLab } from '@/lib/store/arc-lab';
+import { usePlayerId } from '@/components/arc-lab/providers';
 import AgentPlay from './agent-play';
+import NotebookAgent from './notebook-agent';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -53,14 +55,30 @@ interface AgentAggregate {
   avgMs: number;
 }
 
+interface OfficialMeta {
+  dataset: 'training' | 'evaluation';
+  freshNumber: number;
+  seen: number;
+  total: number;
+}
+
 export default function AgentLab() {
   const patterns = useArcLab((s) => s.patterns);
+  const playerId = usePlayerId();
   const [agentId, setAgentId] = React.useState('arcjepa-engine');
   const [world, setWorld] = React.useState(1);
   const [levelIdx, setLevelIdx] = React.useState(0);
   const [imported, setImported] = React.useState<Task | null>(null);
   const [importText, setImportText] = React.useState('');
   const [importError, setImportError] = React.useState<string | null>(null);
+
+  // official ARC-AGI-2 fresh-puzzle flow
+  const [srcTab, setSrcTab] = React.useState('curriculum');
+  const [officialTask, setOfficialTask] = React.useState<Task | null>(null);
+  const [officialMeta, setOfficialMeta] = React.useState<OfficialMeta | null>(null);
+  const [officialDataset, setOfficialDataset] = React.useState<'training' | 'evaluation'>('training');
+  const [officialBusy, setOfficialBusy] = React.useState(false);
+  const [officialMsg, setOfficialMsg] = React.useState<string | null>(null);
 
   // per-agent config
   const [customCode, setCustomCode] = React.useState('');
@@ -82,12 +100,52 @@ export default function AgentLab() {
   const level = worldLevels[Math.min(levelIdx, worldLevels.length - 1)] ?? LEVELS[0];
   const task = React.useMemo(() => {
     if (imported) return imported;
+    if (officialTask) return officialTask;
     try {
       return levelTask(level.id, { reveal: true });
     } catch {
       return null;
     }
-  }, [imported, level.id]);
+  }, [imported, officialTask, level.id]);
+
+  const serveFreshPuzzle = React.useCallback(async () => {
+    if (!playerId || officialBusy) return;
+    setOfficialBusy(true);
+    setOfficialMsg(null);
+    try {
+      const res = await fetch(
+        `/api/official/next?playerId=${encodeURIComponent(playerId)}&agentId=${encodeURIComponent(agent.id)}&dataset=${officialDataset}`,
+        { cache: 'no-store' },
+      );
+      const data = (await res.json()) as {
+        exhausted?: boolean;
+        message?: string;
+        dataset?: 'training' | 'evaluation';
+        taskId?: string;
+        freshNumber?: number;
+        seen?: number;
+        total?: number;
+        task?: Task;
+        error?: string;
+      };
+      if (!res.ok) throw new Error(data.error ?? `Request failed: ${res.status}`);
+      if (data.exhausted) {
+        setOfficialTask(null);
+        setOfficialMeta(null);
+        setOfficialMsg(data.message ?? 'All puzzles seen for this agent.');
+        return;
+      }
+      if (data.task) {
+        setOfficialTask(data.task);
+        setOfficialMeta({ dataset: data.dataset ?? officialDataset, freshNumber: data.freshNumber ?? 1, seen: data.seen ?? 0, total: data.total ?? 0 });
+        setImported(null);
+      }
+    } catch (err) {
+      setOfficialMsg(err instanceof Error ? err.message : 'failed to fetch a fresh puzzle');
+    } finally {
+      setOfficialBusy(false);
+    }
+  }, [playerId, officialBusy, agent.id, officialDataset]);
 
   const config: Record<string, unknown> = React.useMemo(() => {
     if (agentId === 'custom-js') return { code: customCode };
@@ -206,6 +264,8 @@ export default function AgentLab() {
         </p>
       </header>
 
+      <NotebookAgent playerId={playerId} />
+
       <div className="grid gap-4 lg:grid-cols-[340px_1fr]">
         {/* ──────────── left column: agent registry + task picker ──────────── */}
         <div className="space-y-4">
@@ -301,11 +361,40 @@ export default function AgentLab() {
               <CardTitle className="text-sm font-bold uppercase tracking-wider text-muted-foreground">2 · Choose a puzzle</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3 p-4 pt-0">
-              <Tabs defaultValue="curriculum">
+              <Tabs value={srcTab} onValueChange={(v) => { setSrcTab(v); if (v !== 'official') { setOfficialTask(null); setOfficialMeta(null); setOfficialMsg(null); } if (v !== 'import') setImported(null); }}>
                 <TabsList className="w-full">
                   <TabsTrigger value="curriculum" className="flex-1 text-xs">Curriculum</TabsTrigger>
+                  <TabsTrigger value="official" className="flex-1 text-xs">Official ARC-AGI-2</TabsTrigger>
                   <TabsTrigger value="import" className="flex-1 text-xs">Import JSON</TabsTrigger>
                 </TabsList>
+                <TabsContent value="official" className="space-y-3 pt-3">
+                  <Select value={officialDataset} onValueChange={(v) => { setOfficialDataset(v as 'training' | 'evaluation'); setOfficialTask(null); setOfficialMeta(null); setOfficialMsg(null); }}>
+                    <SelectTrigger aria-label="Official dataset"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="training">Training — 1,000 tasks</SelectItem>
+                      <SelectItem value="evaluation">Public evaluation — 120 tasks</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Button onClick={() => void serveFreshPuzzle()} disabled={officialBusy} className="w-full gap-2">
+                    {officialBusy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Shuffle className="h-4 w-4" aria-hidden />}
+                    Serve me a NEW puzzle
+                  </Button>
+                  {officialMeta && (
+                    <div className="space-y-1 rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-2.5 text-xs">
+                      <p className="flex items-center gap-1.5 font-semibold text-emerald-700 dark:text-emerald-300">
+                        <RefreshCw className="h-3 w-3" aria-hidden /> fresh #{officialMeta.freshNumber} · {officialMeta.seen}/{officialMeta.total} seen by {agent.name}
+                      </p>
+                      <p className="text-muted-foreground">Never repeated: the server excludes every puzzle this agent has already been served. Answers stay server-side until the agent commits its prediction.</p>
+                    </div>
+                  )}
+                  {officialTask && (
+                    <Button variant="outline" size="sm" className="w-full gap-1.5 text-xs" onClick={() => void serveFreshPuzzle()} disabled={officialBusy}>
+                      <Shuffle className="h-3.5 w-3.5" aria-hidden /> Next fresh puzzle
+                    </Button>
+                  )}
+                  {officialMsg && <p className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-300">{officialMsg}</p>}
+                  <p className="text-xs text-muted-foreground">The official ARC-AGI-2 set from github.com/arcprize/ARC-AGI-2 — identical to the Kaggle ARC Prize 2026 public data and the tasks on arcprize.org.</p>
+                </TabsContent>
                 <TabsContent value="curriculum" className="space-y-3 pt-3">
                   <Select value={String(world)} onValueChange={(v) => { setWorld(Number(v)); setLevelIdx(0); }}>
                     <SelectTrigger aria-label="World"><SelectValue /></SelectTrigger>
@@ -319,12 +408,12 @@ export default function AgentLab() {
                   </Select>
                   <div className="grid grid-cols-5 gap-1.5">
                     {worldLevels.map((l, i) => (
-                      <Button key={l.id} variant={i === levelIdx ? 'default' : 'outline'} size="sm" className="h-8 px-0 text-xs" onClick={() => { setLevelIdx(i); setImported(null); }} aria-label={`Level ${i + 1}`}>
+                      <Button key={l.id} variant={i === levelIdx ? 'default' : 'outline'} size="sm" className="h-8 px-0 text-xs" onClick={() => { setLevelIdx(i); setImported(null); setOfficialTask(null); setOfficialMeta(null); }} aria-label={`Level ${i + 1}`}>
                         {i + 1}
                       </Button>
                     ))}
                   </div>
-                  {level && <p className="text-xs text-muted-foreground">{level.title} · {level.difficulty} · {level.skills.join(', ')}</p>}
+                  {level && <p className="text-xs text-muted-foreground">{level.title} · {level.worldDifficulty} · {level.skills.join(', ')}</p>}
                 </TabsContent>
                 <TabsContent value="import" className="space-y-2 pt-3">
                   <Textarea
@@ -358,7 +447,16 @@ export default function AgentLab() {
           <Card>
             <CardContent className="p-4 sm:p-6">
               {task ? (
-                <AgentPlay task={task} agent={agent} config={config} patterns={patterns} onScored={handleScored} />
+                <AgentPlay
+                  key={`${task.id}-${agent.id}-${officialMeta?.freshNumber ?? 'local'}`}
+                  task={task}
+                  agent={agent}
+                  config={config}
+                  patterns={patterns}
+                  onScored={handleScored}
+                  remote={officialTask && officialMeta ? { dataset: officialMeta.dataset, agentId: agent.id, playerId } : undefined}
+                  onRemoteScored={() => setOfficialMeta((m) => (m ? { ...m, seen: m.seen + 1 } : m))}
+                />
               ) : (
                 <p className="text-sm text-muted-foreground">Select a puzzle to begin.</p>
               )}

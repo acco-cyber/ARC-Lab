@@ -8,7 +8,7 @@ ARC Lab is one integrated product with four experiences built on a **single shar
 
 | Experience | What it is | Who it's for |
 |---|---|---|
-| 🤖 **Agent Lab** | Watch AI agents play ARC puzzles: the real acco-cyber/ARC-AGI-2 symbolic engine (vendored, CPU mode), APEX-style verified program synthesis, LLM reasoners, your own JS/HTTP agents — with step traces, cell-painting replays, honest scoring and batch tests | Agent builders |
+| 🤖 **Agent Lab** | Watch AI agents play ARC puzzles: **drop in your own .ipynb notebook**, the real acco-cyber/ARC-AGI-2 symbolic engine (vendored, CPU mode), APEX-style verified program synthesis, LLM reasoners, your own JS/HTTP agents — over the curriculum **and the full official ARC-AGI-2 set (1,120 tasks, never served twice)** | Agent builders |
 | 🎓 **ARC Academy** | A 100-level hands-on puzzle game (10 worlds × 10 levels) with an interactive grid editor, tiered hints, XP/badges, daily challenges and progress tracking | Beginners — no ML background required |
 | 🔬 **ARC Workbench** | A visual reasoning debugger: example inspector, object detection with overlays, a 20-op DSL program builder, bounded program search, and step-by-step execution traces | Researchers & puzzle hunters |
 | ⚔️ **ARC Arena** | A reproducible evaluation platform: 7 baseline solvers (symbolic, search, ensemble, LLM) with exact accuracy, pass@2, pixel accuracy, runtime and a failure taxonomy | Solver developers |
@@ -67,6 +67,8 @@ No authentication, no external services. Progress is stored locally (anonymous p
 
 ### 🤖 Agent Lab — watch agents play the game
 
+- **📓 Notebook agent** — drop in a real Jupyter notebook by URL (or upload it). ARC Lab **analyzes** it (cells, imports, pip installs, GPU-only deps, `%%writefile` modules, solver entrypoints, methodology), **executes** its code cells in a python3 sandbox with per-cell stdout/error logs, probes the namespace for a solver entrypoint and tests call conventions against the demonstration pairs, and — when the notebook needs GPU-only deps like vLLM/unsloth — **replays the notebook's own methodology** (verified program synthesis using the notebook's vendored helper toolkit, e.g. `arckit.py`, with the LLM backend substituted for its model). Prefilled with [acco-cyber/ARC-AGI-2](https://github.com/acco-cyber/ARC-AGI-2)'s `arc2-qwen-solo.ipynb`.
+- **Official ARC-AGI-2 puzzles — always fresh** — the complete public set (1,000 training + 120 public evaluation tasks) is vendored from [github.com/arcprize/ARC-AGI-2](https://github.com/arcprize/ARC-AGI-2) (Apache-2.0) — the same public data as the Kaggle ARC Prize 2026 competition and the tasks on arcprize.org. The server tracks every puzzle each agent has been served and **never serves the same puzzle twice**; expected answers stay server-side until the agent commits, then are revealed with the score. History is resettable per agent.
 - **arc-jepa Engine** — the *actual* symbolic solver from [acco-cyber/ARC-AGI-2](https://github.com/acco-cyber/ARC-AGI-2) runs inside ARC Lab (`engine/arcjepa/`, torch made optional): induction → typed-DSL beam search → verification → AST repair → A* → evolution. Measured on the curriculum: **10/12 exact (83%), 94.2% avg pixel accuracy, 4.8 s avg on CPU** (see `docs/AGENT-ENGINE-REPORT.md`).
 - **APEX-style Synthesizer** — a faithful port of the repo's Phase-B "verified program synthesis" methodology: the LLM writes programs, a program is accepted only if it reproduces **every** demonstration exactly, with failing-pair repair rounds and a direct-grid fallback.
 - **Plug in your own agent** — paste a JavaScript solver (sandboxed in a Web Worker, auto-verified against every example) or point at an HTTP endpoint (`{train, testInputs} → {attempts|prediction}`), e.g. your vLLM solver behind a tiny shim.
@@ -103,7 +105,8 @@ Metrics reported (official-style scoring kept strictly separate from diagnostics
 
 ## Dataset & licensing policy
 
-- The Academy curriculum is **fully original and synthetic** (`arc-lab-curriculum-v1`), generated deterministically from per-level seeds. No official ARC evaluation tasks are redistributed or used in the game, so human exposure cannot contaminate benchmark interpretation.
+- The Academy curriculum is **fully original and synthetic** (`arc-lab-curriculum-v1`), generated deterministically from per-level seeds — the game never reuses official tasks, so human exposure cannot contaminate benchmark interpretation.
+- The Agent Lab (and Workbench loader) additionally vendors the **complete public ARC-AGI-2 set** (1,000 training + 120 public evaluation tasks, `data/arc-agi-2/`, provenance in [`data/arc-agi-2/SOURCE.md`](data/arc-agi-2/SOURCE.md)) under the upstream Apache-2.0 license. The semi-private and fully-private competition sets are not public and are not included.
 - You can import official or third-party ARC JSON files into the Workbench and Arena yourself; imported tasks stay local to your session and are clearly labeled as user imports.
 
 ## Architecture

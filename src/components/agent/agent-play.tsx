@@ -37,6 +37,10 @@ interface AgentPlayProps {
   config: Record<string, unknown>;
   patterns: boolean;
   onScored?: (score: ScoreInfo & { agentId: string; taskId: string; elapsedMs: number }) => void;
+  /** When set, scoring happens server-side against withheld answers (official ARC-AGI-2 flow). */
+  remote?: { dataset: string; agentId: string; playerId: string };
+  /** Fired after a successful server-side score (lets the parent refresh counters). */
+  onRemoteScored?: () => void;
 }
 
 function stepIcon(kind: string, ok?: boolean) {
@@ -47,7 +51,7 @@ function stepIcon(kind: string, ok?: boolean) {
   return <ChevronRight className="h-4 w-4 text-amber-600" aria-hidden />;
 }
 
-export default function AgentPlay({ task, agent, config, patterns, onScored }: AgentPlayProps) {
+export default function AgentPlay({ task, agent, config, patterns, onScored, remote, onRemoteScored }: AgentPlayProps) {
   const [phase, setPhase] = React.useState<Phase>('idle');
   const [result, setResult] = React.useState<AgentRunResult | null>(null);
   const [visibleSteps, setVisibleSteps] = React.useState(0);
@@ -55,6 +59,8 @@ export default function AgentPlay({ task, agent, config, patterns, onScored }: A
   const [paintProgress, setPaintProgress] = React.useState(0);
   const [currentCell, setCurrentCell] = React.useState<[number, number] | undefined>(undefined);
   const [score, setScore] = React.useState<ScoreInfo | null>(null);
+  const [revealed, setRevealed] = React.useState<Grid[]>([]);
+  const [scoringRemote, setScoringRemote] = React.useState(false);
   const timersRef = React.useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const intervalRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -79,10 +85,12 @@ export default function AgentPlay({ task, agent, config, patterns, onScored }: A
     setPaintProgress(0);
     setCurrentCell(undefined);
     setScore(null);
+    setRevealed([]);
+    setScoringRemote(false);
   }, [task.id, agent.id, clearTimers]);
 
   const testInput = task.test[0]?.input ?? [];
-  const expected = task.test[0]?.output ?? null;
+  const expected = task.test[0]?.output ?? revealed[0] ?? null;
 
   function computeScore(res: AgentRunResult): ScoreInfo | null {
     if (!expected) return null;
@@ -94,6 +102,65 @@ export default function AgentPlay({ task, agent, config, patterns, onScored }: A
     const pixelAcc = shapeOk ? 1 - diffCells / Math.max(1, d.totalCells) : 0;
     const pass2 = res.attempts[0]?.some((p) => p && p.length === expected.length && p[0]?.length === expected[0]?.length && p.every((row, r) => row.every((c, ci) => c === expected[r][ci]))) ?? false;
     return { exact: shapeOk && diffCells === 0, pass2, pixelAcc, shapeOk, diffCells };
+  }
+
+  async function scoreRemote(res: AgentRunResult): Promise<ScoreInfo | null> {
+    if (!remote) return null;
+    setScoringRemote(true);
+    try {
+      const res2 = await fetch('/api/official/score', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playerId: remote.playerId,
+          agentId: remote.agentId,
+          dataset: remote.dataset,
+          taskId: task.id,
+          attempts: res.attempts,
+          elapsedMs: res.elapsedMs,
+          engine: res.engine,
+        }),
+      });
+      const data = (await res2.json()) as {
+        score?: { exact: boolean | null; pass2: boolean | null; pixelAcc: number | null; shapeOk: boolean; diffCells: number | null };
+        expected?: Grid[];
+        error?: string;
+      };
+      if (!res2.ok || !data.score) throw new Error(data.error ?? 'scoring failed');
+      setRevealed(data.expected ?? []);
+      const truth = (data.expected ?? [])[0] ?? null;
+      const pred = res.attempts[0]?.[0] ?? null;
+      const shapeOk = data.score.shapeOk;
+      return {
+        exact: data.score.exact,
+        pass2: data.score.pass2,
+        pixelAcc: data.score.pixelAcc,
+        shapeOk,
+        diffCells: data.score.diffCells ?? (truth && pred && shapeOk ? diffGrids(pred, truth).diffCells : truth ? truth.length * (truth[0]?.length ?? 0) : 0),
+      };
+    } catch {
+      return { exact: null, pass2: null, pixelAcc: null, shapeOk: false, diffCells: 0 };
+    } finally {
+      setScoringRemote(false);
+    }
+  }
+
+  async function finishScoring(res: AgentRunResult) {
+    if (task.test[0]?.output) {
+      const s = computeScore(res);
+      setScore(s);
+      setPhase('scored');
+      if (s && onScored) onScored({ ...s, agentId: agent.id, taskId: task.id, elapsedMs: res.elapsedMs });
+      return;
+    }
+    if (remote) {
+      const s = await scoreRemote(res);
+      setScore(s);
+      setPhase('scored');
+      if (s && onScored) onScored({ ...s, agentId: agent.id, taskId: task.id, elapsedMs: res.elapsedMs });
+      return;
+    }
+    setPhase('scored');
   }
 
   async function runAgent() {
@@ -176,11 +243,8 @@ export default function AgentPlay({ task, agent, config, patterns, onScored }: A
               if (intervalRef.current) clearInterval(intervalRef.current);
               intervalRef.current = null;
               setCurrentCell(undefined);
-              // ── score
-              const s = computeScore(res);
-              setScore(s);
-              setPhase('scored');
-              if (s && onScored) onScored({ ...s, agentId: agent.id, taskId: task.id, elapsedMs: res.elapsedMs });
+              // ── score (local or server-side for official tasks)
+              void finishScoring(res);
             }
           }, 22);
         },
@@ -309,6 +373,12 @@ export default function AgentPlay({ task, agent, config, patterns, onScored }: A
                   <GridView grid={attempt2} cellSize={Math.max(8, Math.min(14, 140 / Math.max(1, dims(attempt2).w)))} patterns={patterns} ariaLabel="Second attempt grid" />
                 </div>
               )}
+              {phase === 'scored' && expected && !task.test[0]?.output && (
+                <div>
+                  <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Expected (revealed after commit)</p>
+                  <GridView grid={expected} cellSize={Math.max(8, Math.min(14, 140 / Math.max(1, dims(expected).w)))} patterns={patterns} ariaLabel="Expected output grid" />
+                </div>
+              )}
             </div>
             {phase === 'painting' && <Progress value={paintProgress} aria-label="Painting progress" />}
             {/* score card */}
@@ -318,14 +388,19 @@ export default function AgentPlay({ task, agent, config, patterns, onScored }: A
                   {score.exact === true && <Badge className="gap-1 bg-emerald-600 hover:bg-emerald-600"><CheckCircle2 className="h-3.5 w-3.5" aria-hidden />Solved — exact match</Badge>}
                   {score.exact === false && score.pass2 === true && <Badge variant="secondary" className="gap-1"><CheckCircle2 className="h-3.5 w-3.5" aria-hidden />Solved on attempt 2 (pass@2)</Badge>}
                   {score.exact === false && score.pass2 === false && <Badge variant="destructive" className="gap-1"><XCircle className="h-3.5 w-3.5" aria-hidden />Not solved</Badge>}
+                  {score.exact === null && <Badge variant="secondary" className="gap-1">Scoring unavailable</Badge>}
                   <span className="text-xs text-muted-foreground">
-                    pixel accuracy {(score.pixelAcc * 100).toFixed(1)}%
-                    {!score.shapeOk && ' · wrong output shape'}
-                    {score.shapeOk && score.diffCells > 0 && ` · ${score.diffCells} wrong cell${score.diffCells === 1 ? '' : 's'}`}
-                    {' · '}agent time {((result?.elapsedMs ?? 0) / 1000).toFixed(2)}s
+                    {scoringRemote ? 'scoring server-side…' : (
+                      <>
+                        pixel accuracy {score.pixelAcc !== null ? `${(score.pixelAcc * 100).toFixed(1)}%` : '—'}
+                        {!score.shapeOk && ' · wrong output shape'}
+                        {score.shapeOk && score.diffCells > 0 && ` · ${score.diffCells} wrong cell${score.diffCells === 1 ? '' : 's'}`}
+                        {' · '}agent time {((result?.elapsedMs ?? 0) / 1000).toFixed(2)}s
+                      </>
+                    )}
                   </span>
                 </div>
-                {!expected && <p className="mt-1 text-xs text-muted-foreground">This task has no stored answer — scoring is only available for curriculum puzzles and imported tasks with outputs.</p>}
+                {!expected && !remote && <p className="mt-1 text-xs text-muted-foreground">This task has no stored answer — scoring is only available for curriculum puzzles and imported tasks with outputs.</p>}
               </div>
             )}
             {phase === 'scored' && !result?.ok && (

@@ -422,7 +422,7 @@ function AgentsTab() {
           pred = testInput.map((r) => [...r]);
         } else {
           const best = cands[0];
-          program = describeProgram(best.program);
+          program = describeProgram(best.program).join(' → ');
           push({ kind: 'think', label: 'Best program: ' + program });
           push({ kind: 'verify', label: 'Program applied to the test input.', ok: true });
           pred = applyProgram(testInput, best.program) ?? testInput.map((r) => [...r]);

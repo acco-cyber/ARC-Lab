@@ -10,7 +10,7 @@
 
 import React from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Braces, Download, FileUp, FlaskConical, Loader2, TriangleAlert } from 'lucide-react';
+import { Braces, Download, FileUp, FlaskConical, Loader2, Shuffle, TriangleAlert } from 'lucide-react';
 import { api } from '@/lib/client/api';
 import { validateArcJson, type Task } from '@/lib/arc/types';
 import { Badge } from '@/components/ui/badge';
@@ -19,6 +19,7 @@ import { Label } from '@/components/ui/label';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
+import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
 
@@ -181,6 +182,35 @@ export function TaskSourceSidebar({
     importText(DEMO_TASK_JSON, DEMO_TASK_ID);
   }, [importText]);
 
+  // ── official ARC-AGI-2 loader state
+  const [officialDs, setOfficialDs] = React.useState<'training' | 'evaluation'>('training');
+  const [officialId, setOfficialId] = React.useState('');
+  const [officialErr, setOfficialErr] = React.useState<string | null>(null);
+  const [officialBusy, setOfficialBusy] = React.useState(false);
+
+  const loadOfficial = React.useCallback(
+    async (rawId: string) => {
+      setOfficialBusy(true);
+      setOfficialErr(null);
+      try {
+        const id = rawId.trim().toLowerCase() || 'random';
+        if (id !== 'random' && !/^[0-9a-f]{8}$/.test(id)) {
+          setOfficialErr('Task ids are 8 hex characters, e.g. 007bbfb7.');
+          return;
+        }
+        const res = await fetch(`/api/official/task?dataset=${officialDs}&id=${id}&reveal=1`, { cache: 'no-store' });
+        const data = (await res.json()) as { task?: Task; error?: string };
+        if (!res.ok || !data.task) throw new Error(data.error ?? `Request failed: ${res.status}`);
+        acceptTask(data.task);
+      } catch (err) {
+        setOfficialErr(err instanceof Error ? err.message : 'failed to load official task');
+      } finally {
+        setOfficialBusy(false);
+      }
+    },
+    [acceptTask, officialDs],
+  );
+
   return (
     <div className="space-y-4 rounded-xl border bg-card p-3 text-sm">
       {/* ------------------------------ Curriculum ----------------------------- */}
@@ -260,6 +290,60 @@ export function TaskSourceSidebar({
             </ScrollArea>
           )}
         </div>
+      </section>
+
+      <Separator />
+
+      {/* --------------------------- Official ARC-AGI-2 ------------------------ */}
+      <section aria-label="Load an official ARC-AGI-2 task">
+        <h3 className="mb-2 flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-muted-foreground">
+          <Braces className="h-3.5 w-3.5 text-sky-600" aria-hidden />
+          Official ARC-AGI-2
+        </h3>
+        <Label htmlFor="wb-official-ds" className="mb-1 block text-xs text-muted-foreground">
+          Dataset
+        </Label>
+        <Select value={officialDs} onValueChange={(v) => setOfficialDs(v as 'training' | 'evaluation')}>
+          <SelectTrigger id="wb-official-ds" size="sm" className="w-full" aria-label="Official dataset">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="training">training — 1,000 tasks</SelectItem>
+            <SelectItem value="evaluation">evaluation — 120 tasks</SelectItem>
+          </SelectContent>
+        </Select>
+        <div className="mt-2 flex gap-1.5">
+          <Input
+            id="wb-official-id"
+            value={officialId}
+            onChange={(e) => setOfficialId(e.target.value)}
+            placeholder="task id · 007bbfb7"
+            className="h-8 flex-1 font-mono text-xs"
+            aria-label="Official task id"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void loadOfficial(officialId);
+            }}
+          />
+          <Button size="sm" variant="outline" className="h-8 gap-1 px-2" onClick={() => void loadOfficial(officialId)} disabled={officialBusy}>
+            {officialBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Braces className="h-3.5 w-3.5" aria-hidden />}
+            Load
+          </Button>
+        </div>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="mt-1.5 h-7 w-full gap-1.5 text-xs text-muted-foreground"
+          onClick={() => void loadOfficial('random')}
+          disabled={officialBusy}
+        >
+          <Shuffle className="h-3.5 w-3.5" aria-hidden /> Surprise me (random official task)
+        </Button>
+        {officialErr && (
+          <p className="mt-1 text-xs text-rose-600 dark:text-rose-400" role="alert">
+            {officialErr}
+          </p>
+        )}
+        <p className="mt-1 text-[11px] text-muted-foreground">The vendored github.com/arcprize/ARC-AGI-2 set — same public data as Kaggle ARC Prize 2026 and arcprize.org.</p>
       </section>
 
       <Separator />

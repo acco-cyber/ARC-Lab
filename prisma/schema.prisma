@@ -63,3 +63,22 @@ model ArenaRun {
 
   @@index([playerId])
 }
+
+/// One agent-vs-puzzle run. Powers the "never serve the same puzzle twice"
+/// guarantee: the next-puzzle picker excludes every row's taskId.
+model AgentPuzzleRun {
+  id        String   @id @default(cuid())
+  playerId  String
+  agentId   String
+  dataset   String
+  taskId    String
+  exact     Boolean?
+  pass2     Boolean?
+  pixelAcc  Float?
+  elapsedMs Int?
+  engine    String?
+  createdAt DateTime @default(now())
+
+  @@unique([playerId, agentId, dataset, taskId])
+  @@index([playerId, agentId, dataset])
+}

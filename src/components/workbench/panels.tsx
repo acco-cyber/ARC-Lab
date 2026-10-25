@@ -154,13 +154,19 @@ export function ExamplesPanel({ task, selectedPairIdx, onSelectPair, runAll, onR
       <div className="rounded-lg border border-dashed p-3">
         <div className="mb-2 flex flex-wrap items-center gap-2">
           <h4 className="text-sm font-semibold">Test input{task.test.length > 1 ? `s (${task.test.length})` : ''}</h4>
-          <Badge variant="outline" className="border-amber-500/50 text-amber-600 dark:text-amber-400">
-            output hidden (research integrity)
-          </Badge>
+          {task.test.every((p) => p.output) ? (
+            <Badge variant="outline" className="border-emerald-500/50 text-emerald-600 dark:text-emerald-400">
+              expected output revealed (loaded with reveal)
+            </Badge>
+          ) : (
+            <Badge variant="outline" className="border-amber-500/50 text-amber-600 dark:text-amber-400">
+              output hidden (research integrity)
+            </Badge>
+          )}
         </div>
         <div className="flex flex-wrap items-start gap-3">
           {task.test.map((p, i) => (
-            <PairViewer key={i} index={task.train.length + i} input={p.input} output={null} labels={['Test input', 'Hidden output']} />
+            <PairViewer key={i} index={task.train.length + i} input={p.input} output={p.output ?? null} labels={['Test input', p.output ? 'Expected output' : 'Hidden output']} />
           ))}
         </div>
         <p className="mt-2 text-[11px] leading-snug text-muted-foreground">

@@ -116,10 +116,12 @@ export default function AppShell() {
                     size="sm"
                     onClick={() => setTab(t.id)}
                     aria-current={tab === t.id ? 'page' : undefined}
+                    title={t.label}
                     className={cn('gap-1.5 px-2 sm:px-3', tab === t.id && 'font-semibold')}
                   >
                     {t.icon}
-                    <span className={cn('hidden md:inline', t.id !== 'home' && 'inline')}>{t.label}</span>
+                    <span className="hidden sm:inline">{t.label}</span>
+                    <span className="sr-only sm:hidden">{t.label}</span>
                   </Button>
                 </li>
               ))}
@@ -194,8 +196,8 @@ function HomeView() {
           aria-hidden
         />
         <div className="relative max-w-3xl space-y-4">
-          <Badge variant="outline" className="gap-1 border-amber-500/50 text-amber-600 dark:text-amber-400">
-            <Sparkles className="h-3 w-3" /> 100 levels · 7 solvers · AI agents that play · 1 shared reasoning core
+          <Badge variant="outline" className="flex w-fit flex-wrap gap-1 whitespace-normal border-amber-500/50 text-amber-600 dark:text-amber-400">
+            <Sparkles className="h-3 w-3 shrink-0" /> 100 levels · 1,120 official ARC-AGI-2 puzzles · notebooks as agents · 1 shared reasoning core
           </Badge>
           <h1 className="text-3xl font-extrabold tracking-tight sm:text-5xl">
             Learn to reason. <span className="text-emerald-500">Watch agents reason.</span> Benchmark it.
@@ -361,11 +363,13 @@ function GuideView() {
           <AccordionContent className="space-y-2 text-sm text-muted-foreground">
             <ul className="list-disc space-y-1 pl-4">
               <li><strong className="text-foreground">Watch agents play</strong> — pick any puzzle and an agent, then watch its reasoning trace and the answer being painted cell by cell, followed by honest scoring (exact match, pass@2, pixel accuracy).</li>
+              <li><strong className="text-foreground">Notebook agent</strong> — drop in a real Jupyter notebook (.ipynb) by URL or upload. ARC Lab analyzes it (cells, dependencies, GPU needs, entrypoints, methodology), executes its cells in a python3 sandbox, probes for a solver entrypoint verified against the demonstrations, and — when the notebook needs GPU-only deps like vLLM — replays the notebook's own verified-program-synthesis methodology with its vendored helper toolkit and an LLM backend. Try it with <code className="rounded bg-muted px-1">acco-cyber/ARC-AGI-2</code>'s <code className="rounded bg-muted px-1">arc2-qwen-solo.ipynb</code> (prefilled).</li>
+              <li><strong className="text-foreground">Official ARC-AGI-2 puzzles, always fresh</strong> — the full official set (1,000 training + 120 public evaluation tasks, vendored from github.com/arcprize/ARC-AGI-2 — the same public data as the Kaggle ARC Prize 2026 competition and arcprize.org) is playable. The server tracks every puzzle an agent has been served and <strong className="text-foreground">never serves the same puzzle twice</strong> — every run is a brand-new puzzle. Reset the history per agent whenever you want to start over.</li>
               <li><strong className="text-foreground">arc-jepa engine</strong> — the real symbolic solver from acco-cyber/ARC-AGI-2 runs inside ARC Lab (induction → DSL beam search → repair → A* → evolution), so you can test the exact code from that repository.</li>
               <li><strong className="text-foreground">APEX-style synthesizer</strong> — replicates the Phase-B methodology of that repo: the LLM writes programs, each program must reproduce every example exactly, with repair rounds and a direct-grid fallback.</li>
               <li><strong className="text-foreground">Plug in your own agent</strong> — paste a JavaScript solver (sandboxed in a Web Worker, auto-verified on the examples) or point at an HTTP endpoint that implements your own backend.</li>
               <li><strong className="text-foreground">Batch tests</strong> — run any agent over a deterministic curriculum sample and read the summary (solved, pass@2, pixel accuracy, runtime).</li>
-              <li>Agents never see the expected test output before predicting — the same rule as the Arena.</li>
+              <li>Agents never see the expected test output before predicting — official-task answers stay server-side and are revealed only after the agent commits its prediction. The same rule as the Arena.</li>
             </ul>
           </AccordionContent>
         </AccordionItem>
@@ -374,8 +378,15 @@ function GuideView() {
           <AccordionContent className="space-y-2 text-sm text-muted-foreground">
             <p>
               The Academy curriculum is fully original and synthetic (dataset <code className="rounded bg-muted px-1">arc-lab-curriculum-v1</code>),
-              generated deterministically from per-level seeds. No official ARC evaluation tasks are redistributed or used for the game, so human
-              exposure cannot contaminate benchmark interpretation.
+              generated deterministically from per-level seeds — the game never reuses official tasks, so human exposure cannot contaminate
+              benchmark interpretation.
+            </p>
+            <p>
+              The <strong className="text-foreground">Agent Lab</strong> (and the Workbench loader) additionally vendors the complete public
+              ARC-AGI-2 set — 1,000 training + 120 public evaluation tasks from <code className="rounded bg-muted px-1">github.com/arcprize/ARC-AGI-2</code>
+              (Apache-2.0), identical to the public splits of the Kaggle ARC Prize 2026 competition data and the tasks shown on arcprize.org. These
+              are used strictly for agent evaluation with a never-repeat serving queue; the semi-private and fully-private competition sets are not
+              public anywhere and are not included.
             </p>
             <p>You can import official or third-party ARC JSON files into the Workbench and Arena yourself — imported tasks stay local to your session and are clearly labeled as user imports.</p>
           </AccordionContent>
