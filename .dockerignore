@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+db/*.db
+*.log
+screenshots
+docs/images
+skills
+examples
+download
+tests
+worklog.md
+.env*

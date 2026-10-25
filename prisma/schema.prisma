@@ -1,0 +1,65 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// Anonymous local player profile (id generated client-side).
+model Player {
+  id        String   @id
+  xp        Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  levels    LevelProgress[]
+  dailies   DailyResult[]
+  runs      ArenaRun[]
+}
+
+/// Per-puzzle progress for a player.
+model LevelProgress {
+  id            String   @id @default(cuid())
+  playerId      String
+  puzzleId      String
+  solved        Boolean  @default(false)
+  attempts      Int      @default(0)
+  wrongAttempts Int      @default(0)
+  hintsUsed     Int      @default(0)
+  updatedAt     DateTime @updatedAt
+  player        Player   @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([playerId, puzzleId])
+  @@index([playerId])
+}
+
+/// Daily challenge results (one row per player per day).
+model DailyResult {
+  id        String   @id @default(cuid())
+  playerId  String
+  date      String
+  solved    Boolean  @default(false)
+  hintsUsed Int      @default(0)
+  updatedAt DateTime @updatedAt
+  player    Player   @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([playerId, date])
+  @@index([playerId])
+}
+
+/// Persisted Arena evaluation runs (reproducibility records).
+model ArenaRun {
+  id        String   @id @default(cuid())
+  playerId  String?
+  config    String
+  summary   String
+  perTask   String
+  createdAt DateTime @default(now())
+  player    Player?  @relation(fields: [playerId], references: [id], onDelete: SetNull)
+
+  @@index([playerId])
+}
