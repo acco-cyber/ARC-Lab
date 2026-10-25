@@ -334,16 +334,82 @@ function AgentsTab() {
   const interval = React.useRef<ReturnType<typeof setInterval> | null>(null);
 
   const levelId = 'w' + world + 'l' + levelN;
+  const [source, setSource] = React.useState<'curriculum' | 'official'>('curriculum');
+  const [ds, setDs] = React.useState<'training' | 'evaluation'>('training');
+  const [officialTask, setOfficialTask] = React.useState<{ id: string; train: Array<{ input: Grid; output: Grid }>; testInput: Grid; testOutput: Grid } | null>(null);
+  const [officialMeta, setOfficialMeta] = React.useState<{ fresh: number; seen: number; total: number } | null>(null);
+  const [officialBusy, setOfficialBusy] = React.useState(false);
+  const [officialMsg, setOfficialMsg] = React.useState<string | null>(null);
+
   const draft = React.useMemo(() => {
+    if (source === 'official' && officialTask) {
+      return {
+        train: officialTask.train,
+        testInput: officialTask.testInput,
+        testOutput: officialTask.testOutput,
+        hints: ['', '', ''] as [string, string, string],
+        explanation: '',
+      };
+    }
     try { return generateLevel(levelId); } catch { return generateLevel('w1l1'); }
-  }, [levelId]);
+  }, [source, officialTask, levelId]);
+
+  // ── official ARC-AGI-2 fresh-puzzle flow (client-side, localStorage never-repeat)
+  const seenKey = 'arc-lab-official-seen-v1';
+  const loadSeen = (d: string): string[] => {
+    try { return JSON.parse(localStorage.getItem(seenKey) || '{}')[d] || []; } catch { return []; }
+  };
+  const saveSeen = (d: string, ids: string[]) => {
+    try {
+      const all = JSON.parse(localStorage.getItem(seenKey) || '{}');
+      all[d] = ids.slice(-2000);
+      localStorage.setItem(seenKey, JSON.stringify(all));
+    } catch { /* ignore */ }
+  };
+  const serveOfficial = async () => {
+    if (officialBusy) return;
+    setOfficialBusy(true); setOfficialMsg(null);
+    try {
+      const res = await fetch('./data/arc-agi-2/' + ds + '-index.json');
+      if (!res.ok) throw new Error('official dataset not found next to this demo (data/arc-agi-2)');
+      const index = await res.json();
+      const seen = loadSeen(ds);
+      const seenSet = new Set(seen);
+      const unseen = index.filter((e: { id: string }) => !seenSet.has(e.id));
+      if (unseen.length === 0) {
+        setOfficialTask(null); setOfficialMeta(null);
+        setOfficialMsg('All ' + index.length + ' ' + ds + ' puzzles have been served to this agent in this browser. Reset the history to start over.');
+        return;
+      }
+      const pick = unseen[Math.floor(Math.random() * unseen.length)];
+      const tres = await fetch('./data/arc-agi-2/' + ds + '/' + pick.id + '.json');
+      if (!tres.ok) throw new Error('failed to load task ' + pick.id);
+      const t = await tres.json();
+      const train = (t.train || []).filter((pp: { output?: unknown }) => pp.output);
+      const expected = (t.test || [])[0]?.output;
+      if (!train.length || !expected) throw new Error('task ' + pick.id + ' has no scored content');
+      setOfficialTask({ id: pick.id, train, testInput: (t.test || [])[0].input, testOutput: expected });
+      const freshSeen = [...seen, pick.id];
+      saveSeen(ds, freshSeen);
+      setOfficialMeta({ fresh: freshSeen.length, seen: freshSeen.length, total: index.length });
+    } catch (err) {
+      setOfficialMsg(err instanceof Error ? err.message : 'failed to serve an official puzzle');
+    } finally {
+      setOfficialBusy(false);
+    }
+  };
+  const resetOfficial = () => {
+    saveSeen(ds, []);
+    setOfficialMeta(null);
+    setOfficialMsg('History reset — puzzles can be served again.');
+  };
 
   React.useEffect(() => () => { timers.current.forEach(clearTimeout); if (interval.current) clearInterval(interval.current); }, []);
   React.useEffect(() => {
     timers.current.forEach(clearTimeout); timers.current = [];
     if (interval.current) { clearInterval(interval.current); interval.current = null; }
     setPhase('idle'); setSteps([]); setVisible(0); setPaintGrid(null); setScore(null); setErrorMsg(null); setCurrent(undefined);
-  }, [levelId, agentId]);
+  }, [levelId, agentId, officialTask]);
 
   const finishScore = (pred: Grid, ms: number, program: string) => {
     const d = diffGrids(pred, draft.testOutput);
@@ -537,14 +603,38 @@ function AgentsTab() {
           </div>
           <div className="side-block">
             <div className="mini-label">2 · Choose a puzzle</div>
-            <select className="select" value={world} onChange={(e) => { setWorld(Number(e.target.value)); setLevelN(1); }}>
-              {WORLDS.map((w) => <option key={w.id} value={w.id}>{String(w.id).padStart(2, '0')} · {w.name}</option>)}
-            </select>
-            <div className="lvlist" style={{ gridTemplateColumns: 'repeat(5, 1fr)' }}>
-              {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
-                <button key={n} className={n === levelN ? 'chip on' : 'chip'} onClick={() => setLevelN(n)}>{n}</button>
-              ))}
+            <div className="chips">
+              <button className={source === 'curriculum' ? 'chip wide on' : 'chip wide'} onClick={() => setSource('curriculum')}>📚 Curriculum</button>
+              <button className={source === 'official' ? 'chip wide on' : 'chip wide'} onClick={() => setSource('official')}>🌍 Official ARC-AGI-2</button>
             </div>
+            {source === 'curriculum' ? (
+              <>
+                <select className="select" value={world} onChange={(e) => { setWorld(Number(e.target.value)); setLevelN(1); }}>
+                  {WORLDS.map((w) => <option key={w.id} value={w.id}>{String(w.id).padStart(2, '0')} · {w.name}</option>)}
+                </select>
+                <div className="lvlist" style={{ gridTemplateColumns: 'repeat(5, 1fr)' }}>
+                  {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+                    <button key={n} className={n === levelN ? 'chip on' : 'chip'} onClick={() => setLevelN(n)}>{n}</button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <select className="select" value={ds} onChange={(e) => { setDs(e.target.value as 'training' | 'evaluation'); setOfficialTask(null); setOfficialMeta(null); setOfficialMsg(null); }}>
+                  <option value="training">Official training — 1,000 tasks</option>
+                  <option value="evaluation">Official evaluation — 120 tasks</option>
+                </select>
+                <button className="btn primary wide" onClick={serveOfficial} disabled={officialBusy}>
+                  {officialBusy ? '…' : '🎲 Serve me a NEW puzzle'}
+                </button>
+                {officialMeta && (
+                  <p className="muted small">fresh #{officialMeta.fresh} · {officialMeta.seen}/{officialMeta.total} seen — never repeated (tracked in this browser) <button className="chip" onClick={resetOfficial}>reset</button></p>
+                )}
+                {officialTask && <p className="muted small mono">task {officialTask.id}</p>}
+                {officialMsg && <p className="muted small" style={{ color: '#f59e0b' }}>{officialMsg}</p>}
+                <p className="muted small">The full official ARC-AGI-2 set (github.com/arcprize/ARC-AGI-2 — same public data as Kaggle ARC Prize 2026 and arcprize.org), served fresh every time.</p>
+              </>
+            )}
           </div>
           <button className="btn primary wide" onClick={run} disabled={phase === 'running' || phase === 'playing' || phase === 'painting'}>
             ▶ Run agent
@@ -564,7 +654,7 @@ function AgentsTab() {
             </div>
           </section>
           <section className="panel">
-            <div className="tracectl"><strong>The play field</strong></div>
+            <div className="tracectl"><strong>The play field</strong>{source === 'official' && officialTask && <span className="badge">official · {ds} · {officialTask.id}</span>}</div>
             <div className="pairs">
               <div className="pair">
                 <GridBox grid={draft.testInput} title="Test input" />
@@ -580,6 +670,7 @@ function AgentsTab() {
               <div className="result" style={{ borderColor: score.exact ? '#10b981' : undefined }}>
                 {score.exact ? '✅ Solved — exact match' : '❌ Not solved'} · pixel accuracy {(score.pixel * 100).toFixed(1)}% · agent time {(score.ms / 1000).toFixed(2)}s
                 {score.program && <span className="mono"> · {score.program.slice(0, 60)}</span>}
+                {source === 'official' && <div className="muted small">Official ARC-AGI-2 task — scored against the public dataset file (client-side demo; the full app withholds answers server-side).</div>}
               </div>
             )}
           </section>
