@@ -15,6 +15,8 @@
 bun install && bun run db:push && bun run dev   # local: http://localhost:3000
 ```
 
+**▶ [Watch the 15-second launch demo (video)](docs/videos/launch-demo.mp4)**
+
 <img src="docs/images/demo.gif" alt="ARC Lab demo — solve a puzzle, build the rule, watch an agent attempt it, compare results" width="860"/>
 
 </div>
