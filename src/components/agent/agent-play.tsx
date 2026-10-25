@@ -227,7 +227,10 @@ export default function AgentPlay({ task, agent, config, patterns, onScored, rem
           setPaintGrid(working);
           setPhase('painting');
           let i = 0;
-          const perTick = Math.max(1, Math.round(order.length / 90)); // finish in ≤ ~90 ticks
+          // Aim for a consistent ~2.4s reveal: batch big grids into ≤90 ticks,
+          // but never tick faster than 28ms so small grids still animate visibly.
+          const perTick = Math.max(1, Math.ceil(order.length / 90));
+          const tickMs = Math.max(28, Math.round(2400 / Math.max(1, order.length)));
           intervalRef.current = setInterval(() => {
             const nextIdx = Math.min(i + perTick, order.length);
             for (let k = i; k < nextIdx; k++) {
@@ -246,7 +249,7 @@ export default function AgentPlay({ task, agent, config, patterns, onScored, rem
               // ── score (local or server-side for official tasks)
               void finishScoring(res);
             }
-          }, 22);
+          }, tickMs);
         },
         stepCount * 650 + 350,
       ),

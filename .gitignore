@@ -68,3 +68,4 @@ server.log
 # local dataset scratch (only data/arc-agi-2 + data/notebooks are tracked)
 data/arc-agi-2-official
 db/*.db-journal
+media-tmp/
