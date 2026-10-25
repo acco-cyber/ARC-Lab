@@ -1,13 +1,14 @@
 # ARC Lab — Interactive Abstract Reasoning Laboratory
 
 <p align="center">
-  <em>Learn to reason. Debug the reasoning. Benchmark it.</em>
+  <em>Learn to reason. Watch agents reason. Benchmark it.</em>
 </p>
 
-ARC Lab is one integrated product with three experiences built on a **single shared ARC core** (grid representation, validation, transformations — one TypeScript implementation everywhere):
+ARC Lab is one integrated product with four experiences built on a **single shared ARC core** (grid representation, validation, transformations — one TypeScript implementation everywhere):
 
 | Experience | What it is | Who it's for |
 |---|---|---|
+| 🤖 **Agent Lab** | Watch AI agents play ARC puzzles: the real acco-cyber/ARC-AGI-2 symbolic engine (vendored, CPU mode), APEX-style verified program synthesis, LLM reasoners, your own JS/HTTP agents — with step traces, cell-painting replays, honest scoring and batch tests | Agent builders |
 | 🎓 **ARC Academy** | A 100-level hands-on puzzle game (10 worlds × 10 levels) with an interactive grid editor, tiered hints, XP/badges, daily challenges and progress tracking | Beginners — no ML background required |
 | 🔬 **ARC Workbench** | A visual reasoning debugger: example inspector, object detection with overlays, a 20-op DSL program builder, bounded program search, and step-by-step execution traces | Researchers & puzzle hunters |
 | ⚔️ **ARC Arena** | A reproducible evaluation platform: 7 baseline solvers (symbolic, search, ensemble, LLM) with exact accuracy, pass@2, pixel accuracy, runtime and a failure taxonomy | Solver developers |
@@ -40,7 +41,7 @@ Or with npm/pnpm: `npm install && npx prisma db push && npm run dev`.
 
 No authentication, no external services. Progress is stored locally (anonymous player id + SQLite). The optional **LLM Adapter** solver uses the z-ai-web-dev-sdk when available and degrades gracefully to a copy-input fallback where it isn't.
 
-## The three experiences
+## The four experiences
 
 ### 🎓 Academy — learn by solving
 
@@ -63,6 +64,14 @@ No authentication, no external services. Progress is stored locally (anonymous p
 - **Import/export**: native ARC JSON (ARC-AGI-1/2 files load directly; unknown fields preserved for forward compatibility with future schema versions).
 
 > Scientific rule enforced in the UI: **a program that fits the demonstration examples has not necessarily discovered the intended rule.** The Workbench distinguishes "fits the examples" from "solves the test case" everywhere it reports results.
+
+### 🤖 Agent Lab — watch agents play the game
+
+- **arc-jepa Engine** — the *actual* symbolic solver from [acco-cyber/ARC-AGI-2](https://github.com/acco-cyber/ARC-AGI-2) runs inside ARC Lab (`engine/arcjepa/`, torch made optional): induction → typed-DSL beam search → verification → AST repair → A* → evolution. Measured on the curriculum: **10/12 exact (83%), 94.2% avg pixel accuracy, 4.8 s avg on CPU** (see `docs/AGENT-ENGINE-REPORT.md`).
+- **APEX-style Synthesizer** — a faithful port of the repo's Phase-B "verified program synthesis" methodology: the LLM writes programs, a program is accepted only if it reproduces **every** demonstration exactly, with failing-pair repair rounds and a direct-grid fallback.
+- **Plug in your own agent** — paste a JavaScript solver (sandboxed in a Web Worker, auto-verified against every example) or point at an HTTP endpoint (`{train, testInputs} → {attempts|prediction}`), e.g. your vLLM solver behind a tiny shim.
+- **Watch it play** — agents reason step by step (observe → think → verify → act), then paint the answer cell by cell, then get scored (exact match, pass@2, pixel accuracy). Agents never see the expected test output before predicting.
+- **Batch tests + scoreboard** — run any agent over a deterministic curriculum sample; per-agent results persist locally.
 
 ### ⚔️ Arena — reproducible evaluation
 

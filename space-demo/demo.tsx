@@ -139,7 +139,7 @@ function markSolved(id: string): string[] {
 // UI
 // ---------------------------------------------------------------------------
 
-type Tab = 'play' | 'search' | 'arena' | 'about';
+type Tab = 'play' | 'agents' | 'search' | 'arena' | 'about';
 
 function GridBox({ grid, cell = 16, highlight = [], onCell, title }: {
   grid: Grid;
@@ -215,9 +215,9 @@ function App() {
           </div>
         </div>
         <nav>
-          {(['play', 'search', 'arena', 'about'] as Tab[]).map((t) => (
+          {(['play', 'agents', 'search', 'arena', 'about'] as Tab[]).map((t) => (
             <button key={t} className={tab === t ? 'navlink active' : 'navlink'} onClick={() => setTab(t)}>
-              {t === 'play' ? 'Academy' : t === 'search' ? 'Workbench' : t === 'arena' ? 'Arena' : 'About'}
+              {t === 'play' ? 'Academy' : t === 'agents' ? 'Agent Lab' : t === 'search' ? 'Workbench' : t === 'arena' ? 'Arena' : 'About'}
             </button>
           ))}
         </nav>
@@ -225,6 +225,7 @@ function App() {
       </header>
       <main>
         {tab === 'play' && <PlayTab xp={xp} setXp={setXp} solved={solved} setSolved={setSolved} />}
+        {tab === 'agents' && <AgentsTab />}
         {tab === 'search' && <SearchTab />}
         {tab === 'arena' && <ArenaTab />}
         {tab === 'about' && <AboutTab />}
@@ -233,6 +234,357 @@ function App() {
         Static client-side demo powered by the real <code>arc-core</code>. Full app (server-validated answers, arena persistence, LLM adapter) on{' '}
         <a href="https://github.com/acco-cyber/ARC-Lab" target="_blank" rel="noreferrer">GitHub</a>.
       </footer>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Agent Lab tab — watch AI agents play the game
+// ---------------------------------------------------------------------------
+
+const WORKER_SRC = `
+self.onmessage = function (e) {
+  const { code, train, testInputs } = e.data;
+  const results = [];
+  const logs = [];
+  try {
+    const H = {
+      dims: (g) => ({ h: g.length, w: g[0] ? g[0].length : 0 }),
+      clone: (g) => g.map((r) => r.slice()),
+      make: (h, w, fill) => Array.from({ length: h }, () => Array(w).fill(fill || 0)),
+      rot90: (g) => { const h = g.length, w = g[0].length; const out = Array.from({ length: w }, () => Array(h).fill(0)); for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) out[c][h - 1 - r] = g[r][c]; return out; },
+      rot180: (g) => g.map((r) => r.slice().reverse()).reverse(),
+      rot270: (g) => { const h = g.length, w = g[0].length; const out = Array.from({ length: w }, () => Array(h).fill(0)); for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) out[w - 1 - c][r] = g[r][c]; return out; },
+      flipH: (g) => g.map((r) => r.slice().reverse()),
+      flipV: (g) => g.slice().reverse(),
+      transpose: (g) => g[0].map((_, c) => g.map((r) => r[c])),
+      recolor: (g, map) => g.map((r) => r.map((c) => (map[c] === undefined ? c : map[c]))),
+      shift: (g, dr, dc) => { const h = g.length, w = g[0].length; const out = Array.from({ length: h }, () => Array(w).fill(0)); for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) { const nr = r + dr, nc = c + dc; if (nr >= 0 && nr < h && nc >= 0 && nc < w) out[nr][nc] = g[r][c]; } return out; },
+      log: (...a) => { logs.push(a.map((x) => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ')); },
+    };
+    let body = code;
+    const declMatch = code.match(/^\\s*(?:async\\s+)?function\\s*[A-Za-z0-9_$]*\\s*\\([^)]*\\)\\s*\\{/);
+    if (declMatch) {
+      const open = code.indexOf('{', declMatch[0].length - 1);
+      let depth = 0;
+      for (let i = open; i < code.length; i++) {
+        if (code[i] === '{') depth++;
+        else if (code[i] === '}') { depth--; if (depth === 0) { body = code.slice(open + 1, i); break; } }
+      }
+    }
+    const factory = new Function('train', 'testInput', 'H', '"use strict";' + body);
+    let solve;
+    try {
+      const maybe = factory(undefined, undefined, H);
+      if (typeof maybe === 'function') solve = maybe;
+      else solve = (t, i) => factory(t, i, H);
+    } catch (probeErr) {
+      solve = (t, i) => factory(t, i, H);
+    }
+    for (const testInput of testInputs) results.push(solve.call(H, train, testInput));
+    self.postMessage({ ok: true, results, logs });
+  } catch (err) {
+    self.postMessage({ ok: false, error: String((err && err.message) || err), logs });
+  }
+};
+`;
+
+function runCustomWorker(code: string, train: Array<{ input: Grid; output: Grid }>, testInputs: Grid[], timeoutMs = 5000): Promise<{ ok: boolean; results?: unknown[]; error?: string; logs?: string[] }> {
+  return new Promise((resolve) => {
+    let worker: Worker;
+    try {
+      const blob = new Blob([WORKER_SRC], { type: 'application/javascript' });
+      worker = new Worker(URL.createObjectURL(blob));
+    } catch (err) {
+      resolve({ ok: false, error: 'worker-unavailable: ' + String(err) });
+      return;
+    }
+    const timer = setTimeout(() => {
+      worker.terminate();
+      resolve({ ok: false, error: 'Timed out after ' + timeoutMs + ' ms (infinite loop?).' });
+    }, timeoutMs);
+    worker.onmessage = (ev: MessageEvent) => { clearTimeout(timer); worker.terminate(); resolve(ev.data); };
+    worker.onerror = (ev) => { clearTimeout(timer); worker.terminate(); resolve({ ok: false, error: ev.message || 'worker-error' }); };
+    worker.postMessage({ code, train, testInputs });
+  });
+}
+
+const AGENT_DEFS = [
+  { id: 'copy-bot', name: 'Copy Bot', emoji: '🪞', desc: 'Echoes the input back — the sanity agent.' },
+  { id: 'rule-sniffer', name: 'Rule Sniffer', emoji: '🔍', desc: 'Single geometric ops → recolors → keep-largest.' },
+  { id: 'program-searcher', name: 'Program Searcher', emoji: '🧩', desc: 'Bounded DSL program search (depth ≤ 2).' },
+  { id: 'custom-js', name: 'My Agent (JS)', emoji: '🧑‍💻', desc: 'Your own solver, sandboxed + auto-verified.' },
+] as const;
+
+type AgentStep = { kind: 'observe' | 'think' | 'verify' | 'act'; label: string; ok?: boolean };
+
+function AgentsTab() {
+  const [agentId, setAgentId] = React.useState<string>('rule-sniffer');
+  const [world, setWorld] = React.useState(1);
+  const [levelN, setLevelN] = React.useState(1);
+  const [customCode, setCustomCode] = React.useState('return testInput.map(r => r.slice());');
+  const [phase, setPhase] = React.useState<'idle' | 'running' | 'playing' | 'painting' | 'scored'>('idle');
+  const [steps, setSteps] = React.useState<AgentStep[]>([]);
+  const [visible, setVisible] = React.useState(0);
+  const [paintGrid, setPaintGrid] = React.useState<Grid | null>(null);
+  const [current, setCurrent] = React.useState<[number, number] | undefined>(undefined);
+  const [score, setScore] = React.useState<{ exact: boolean; pixel: number; ms: number; program: string } | null>(null);
+  const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
+  const timers = React.useRef<Array<ReturnType<typeof setTimeout>>>([]);
+  const interval = React.useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const levelId = 'w' + world + 'l' + levelN;
+  const draft = React.useMemo(() => {
+    try { return generateLevel(levelId); } catch { return generateLevel('w1l1'); }
+  }, [levelId]);
+
+  React.useEffect(() => () => { timers.current.forEach(clearTimeout); if (interval.current) clearInterval(interval.current); }, []);
+  React.useEffect(() => {
+    timers.current.forEach(clearTimeout); timers.current = [];
+    if (interval.current) { clearInterval(interval.current); interval.current = null; }
+    setPhase('idle'); setSteps([]); setVisible(0); setPaintGrid(null); setScore(null); setErrorMsg(null); setCurrent(undefined);
+  }, [levelId, agentId]);
+
+  const finishScore = (pred: Grid, ms: number, program: string) => {
+    const d = diffGrids(pred, draft.testOutput);
+    const pixel = d.shapeEqual ? 1 - d.diffCells / Math.max(1, d.totalCells) : 0;
+    setScore({ exact: d.shapeEqual && d.diffCells === 0, pixel, ms, program });
+    setPhase('scored');
+  };
+
+  const run = async () => {
+    timers.current.forEach(clearTimeout); timers.current = [];
+    if (interval.current) { clearInterval(interval.current); interval.current = null; }
+    setPhase('running'); setSteps([]); setVisible(0); setPaintGrid(null); setScore(null); setErrorMsg(null);
+    const train = draft.train;
+    const testInput = draft.testInput;
+    const t0 = performance.now();
+    const localSteps: AgentStep[] = [];
+    const push = (s: AgentStep) => { localSteps.push(s); setSteps((prev) => [...prev, s]); };
+
+    push({ kind: 'observe', label: 'Studied ' + train.length + ' example pairs (' + testInput.length + '×' + testInput[0].length + ' test input).' });
+
+    let pred: Grid | null = null;
+    let program = '';
+    try {
+      if (agentId === 'copy-bot') {
+        push({ kind: 'think', label: 'Hypothesis: output = input.' });
+        pred = testInput.map((r) => [...r]);
+        program = 'IDENTITY';
+      } else if (agentId === 'rule-sniffer') {
+        push({ kind: 'think', label: 'Trying single geometric ops…' });
+        let found: Grid | null = null;
+        for (const op of GEO_OPS) {
+          if (train.every((p) => gridsEqual(op.fn(p.input), p.output))) {
+            push({ kind: 'verify', label: 'Rule consistent on all examples: ' + op.label, ok: true });
+            found = op.fn(testInput);
+            program = op.label;
+            break;
+          }
+        }
+        if (!found) {
+          push({ kind: 'think', label: 'No geometric op fits — trying recolors…' });
+          const colors = new Set<number>();
+          for (const p of train) { for (const row of p.input) for (const c of row) colors.add(c); for (const row of p.output) for (const c of row) colors.add(c); }
+          for (const a of colors) {
+            for (const b of colors) {
+              if (a === b) continue;
+              if (train.every((p) => gridsEqual(T.recolor(p.input, { [a]: b }), p.output))) {
+                push({ kind: 'verify', label: 'Recolor ' + a + ' → ' + b + ' fits all examples.', ok: true });
+                found = T.recolor(testInput, { [a]: b });
+                program = 'RECOLOR ' + a + '→' + b;
+                break;
+              }
+            }
+            if (found) break;
+          }
+        }
+        if (!found) {
+          push({ kind: 'think', label: 'Trying object heuristic: keep largest…' });
+          const fits = train.every((p) => {
+            const det = findObjects(p.input);
+            if (det.objects.length === 0) return false;
+            return gridsEqual(keepObjects(p.input, [largestObject(det.objects)]), p.output);
+          });
+          if (fits) {
+            push({ kind: 'verify', label: 'Keep-largest fits all examples.', ok: true });
+            found = keepObjects(testInput, [largestObject(findObjects(testInput).objects)]);
+            program = 'KEEP_LARGEST';
+          }
+        }
+        if (!found) { push({ kind: 'verify', label: 'No consistent rule — copy-input fallback.', ok: false }); found = testInput.map((r) => [...r]); }
+        pred = found;
+      } else if (agentId === 'program-searcher') {
+        push({ kind: 'think', label: 'Enumerating DSL programs (depth ≤ 2, 2s budget)…' });
+        const cands = searchPrograms(train as Pair[], { maxOps: 2, timeBudgetMs: 2000, topK: 2 });
+        if (cands.length === 0) {
+          push({ kind: 'verify', label: 'No consistent program within budget.', ok: false });
+          pred = testInput.map((r) => [...r]);
+        } else {
+          const best = cands[0];
+          program = describeProgram(best.program);
+          push({ kind: 'think', label: 'Best program: ' + program });
+          push({ kind: 'verify', label: 'Program applied to the test input.', ok: true });
+          pred = applyProgram(testInput, best.program) ?? testInput.map((r) => [...r]);
+        }
+      } else {
+        // custom-js
+        push({ kind: 'think', label: 'Running your solver on the examples (auto-verification)…' });
+        const selfTest = await runCustomWorker(customCode, train, train.map((p) => p.input));
+        if (!selfTest.ok) {
+          push({ kind: 'verify', label: 'Your code failed on the examples.', ok: false });
+          setErrorMsg(selfTest.error ?? 'custom code error');
+          setPhase('scored');
+          return;
+        }
+        let fit = 0;
+        train.forEach((p, i) => {
+          const got = selfTest.results?.[i];
+          const okFit = Array.isArray(got) && gridsEqual(got as Grid, p.output);
+          if (okFit) fit++;
+          push({ kind: 'verify', label: 'Example ' + (i + 1) + ': ' + (okFit ? 'reproduced ✔' : 'mismatch ✘'), ok: okFit });
+        });
+        const run2 = await runCustomWorker(customCode, train, [testInput], 8000);
+        if (!run2.ok) { push({ kind: 'act', label: 'Test-input run failed.', ok: false }); setErrorMsg(run2.error ?? 'custom code error'); setPhase('scored'); return; }
+        const got = run2.results?.[0];
+        if (!Array.isArray(got)) { push({ kind: 'act', label: 'Solver did not return a grid.', ok: false }); setErrorMsg('Not a valid grid.'); setPhase('scored'); return; }
+        push({ kind: 'act', label: fit === train.length ? 'All ' + fit + ' examples reproduced — applying to test input.' : fit + '/' + train.length + ' examples reproduced — applying anyway.', ok: fit === train.length });
+        pred = got as Grid;
+      }
+    } catch (err) {
+      setErrorMsg(String(err instanceof Error ? err.message : err));
+      setPhase('scored');
+      return;
+    }
+
+    const ms = Math.round(performance.now() - t0);
+    // animate steps then paint (use the locally tracked steps — state is async)
+    const shown = localSteps.length;
+    for (let i = 1; i <= shown + 2; i++) timers.current.push(setTimeout(() => setVisible(i), i * 500));
+    timers.current.push(setTimeout(() => {
+      if (!pred) { finishScore(testInput, ms, program); return; }
+      const changes: Array<[number, number]> = [];
+      const draws: Array<[number, number]> = [];
+      const clears: Array<[number, number]> = [];
+      for (let r = 0; r < pred.length; r++) for (let c = 0; c < (pred[r]?.length ?? 0); c++) {
+        const inB = r < testInput.length && c < (testInput[r]?.length ?? 0);
+        if (!inB || testInput[r][c] !== pred[r][c]) { if (pred[r][c] !== 0) changes.push([r, c]); else clears.push([r, c]); }
+        else if (pred[r][c] !== 0) draws.push([r, c]);
+      }
+      const order = [...changes, ...draws, ...clears];
+      const working: Grid = testInput.map((row) => [...row]);
+      setPaintGrid(working.map((r) => [...r]));
+      setPhase('painting');
+      let i = 0;
+      const per = Math.max(1, Math.round(order.length / 80));
+      interval.current = setInterval(() => {
+        const next = Math.min(i + per, order.length);
+        for (let k = i; k < next; k++) { const [r, c] = order[k]; if (working[r] && c < working[r].length) working[r][c] = pred[r][c]; }
+        i = next;
+        setPaintGrid(working.map((r) => [...r]));
+        const last = order[Math.max(0, i - 1)];
+        setCurrent(last ? [last[0], last[1]] : undefined);
+        if (i >= order.length) {
+          if (interval.current) clearInterval(interval.current);
+          interval.current = null;
+          setCurrent(undefined);
+          finishScore(pred, ms, program);
+        }
+      }, 22);
+    }, (shown + 2) * 500 + 200));
+  };
+
+  const agent = AGENT_DEFS.find((a) => a.id === agentId)!;
+  const shownSteps = steps.slice(0, phase === 'scored' ? undefined : visible);
+  const mismatch: Array<[number, number]> = React.useMemo(() => {
+    if (!score || !paintGrid) return [];
+    const cells: Array<[number, number]> = [];
+    for (let r = 0; r < draft.testOutput.length; r++) for (let c = 0; c < draft.testOutput[r].length; c++) if (paintGrid[r]?.[c] !== draft.testOutput[r][c]) cells.push([r, c]);
+    return cells;
+  }, [score, paintGrid, draft]);
+
+  return (
+    <div className="play">
+      <section className="panel">
+        <div className="levelhead">
+          <h2>🤖 Agent Lab <span className="badge">watch agents play</span></h2>
+        </div>
+        <p className="muted small">
+          Pick a puzzle and an agent, then watch it reason step by step and paint its answer. Bring your own agent as JavaScript — it runs sandboxed and is
+          auto-verified against every example. Agents never see the expected output before predicting. (The full app also runs the real
+          acco-cyber/ARC-AGI-2 engine and LLM synthesizers server-side.)
+        </p>
+      </section>
+      <div className="content">
+        <aside className="side">
+          <div className="side-block">
+            <div className="mini-label">1 · Choose an agent</div>
+            <div className="chips">
+              {AGENT_DEFS.map((a) => (
+                <button key={a.id} className={agentId === a.id ? 'chip wide on' : 'chip wide'} onClick={() => setAgentId(a.id)}>
+                  {a.emoji} {a.name}
+                </button>
+              ))}
+            </div>
+            <p className="muted small">{agent.desc}</p>
+            {agentId === 'custom-js' && (
+              <div className="field">
+                <div className="mini-label">Your solver — function body</div>
+                <textarea className="mono" rows={6} value={customCode} onChange={(e) => setCustomCode(e.target.value)} spellCheck={false} />
+                <p className="muted small">Body of <code>solve(train, testInput)</code>. Helpers: <code>H.rot90/flipH/recolor/shift…</code></p>
+              </div>
+            )}
+          </div>
+          <div className="side-block">
+            <div className="mini-label">2 · Choose a puzzle</div>
+            <select className="select" value={world} onChange={(e) => { setWorld(Number(e.target.value)); setLevelN(1); }}>
+              {WORLDS.map((w) => <option key={w.id} value={w.id}>{String(w.id).padStart(2, '0')} · {w.name}</option>)}
+            </select>
+            <div className="lvlist" style={{ gridTemplateColumns: 'repeat(5, 1fr)' }}>
+              {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+                <button key={n} className={n === levelN ? 'chip on' : 'chip'} onClick={() => setLevelN(n)}>{n}</button>
+              ))}
+            </div>
+          </div>
+          <button className="btn primary wide" onClick={run} disabled={phase === 'running' || phase === 'playing' || phase === 'painting'}>
+            ▶ Run agent
+          </button>
+        </aside>
+        <div className="content">
+          <section className="panel">
+            <div className="tracectl"><strong>Agent trace</strong><span className="muted small">{phase === 'idle' ? 'ready' : phase}</span></div>
+            <div className="hints">
+              {phase === 'idle' && <p className="muted">Press “Run agent”.</p>}
+              {shownSteps.map((s, i) => (
+                <div key={i} className="small" style={{ color: s.ok === false ? '#ef4444' : undefined }}>
+                  {s.ok === true ? '✔ ' : s.ok === false ? '✘ ' : '· '}{s.label}
+                </div>
+              ))}
+              {errorMsg && <div className="small" style={{ color: '#ef4444' }}>Error: {errorMsg}</div>}
+            </div>
+          </section>
+          <section className="panel">
+            <div className="tracectl"><strong>The play field</strong></div>
+            <div className="pairs">
+              <div className="pair">
+                <GridBox grid={draft.testInput} title="Test input" />
+                <span className="arrow">→</span>
+                {paintGrid ? (
+                  <GridBox grid={paintGrid} title="Agent prediction" highlight={phase === 'painting' && current ? [current] : mismatch} />
+                ) : (
+                  <div className="muted small" style={{ alignSelf: 'center', padding: '0 24px' }}>not run yet</div>
+                )}
+              </div>
+            </div>
+            {score && (
+              <div className="result" style={{ borderColor: score.exact ? '#10b981' : undefined }}>
+                {score.exact ? '✅ Solved — exact match' : '❌ Not solved'} · pixel accuracy {(score.pixel * 100).toFixed(1)}% · agent time {(score.ms / 1000).toFixed(2)}s
+                {score.program && <span className="mono"> · {score.program.slice(0, 60)}</span>}
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
     </div>
   );
 }
