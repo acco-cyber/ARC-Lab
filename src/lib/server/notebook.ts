@@ -342,6 +342,26 @@ export function notebookAgentId(rawJson: string): string {
 
 // ─────────────────────────────────────────────────────────── python runner
 
+/**
+ * Preamble prepended to EVERY untrusted-notebook runner: process-wide resource
+ * limits applied before any notebook cell executes. Wall-clock and output-size
+ * limits are enforced by the Node host (execFile timeout + maxBuffer).
+ */
+const PY_SANDBOX_PREAMBLE = String.raw`
+import resource
+for _r, _v in (
+    (resource.RLIMIT_CPU, (60, 60)),        # CPU seconds (wall clock is capped by the host)
+    (resource.RLIMIT_AS, (1 << 30, 1 << 30)),   # 1 GiB address space
+    (resource.RLIMIT_NPROC, (64, 64)),      # no fork bombs
+    (resource.RLIMIT_FSIZE, (8 << 20, 8 << 20)),  # files capped at 8 MiB
+):
+    try:
+        resource.setrlimit(_r, _v)
+    except Exception:
+        pass
+del resource, _r, _v
+`;
+
 const PY_EXEC_RUNNER = String.raw`
 import json, sys, io, os, contextlib, traceback, inspect, types
 
@@ -555,12 +575,51 @@ interface PyVerifyResult {
   entry: string | null;
 }
 
-function runPython(script: string, args: string[], cwd: string, timeoutMs: number): Promise<{ stdout: string; error?: string }> {
+// ─────────────────────────────────────────────────────────── sandboxed python
+
+/**
+ * Hardened execution for UNTRUSTED notebook code. Five layers, all documented
+ * in SECURITY.md:
+ *
+ *   1. network isolation   — `unshare -rn` (fresh user+network namespace, no
+ *                            egress). Probed once; if the host forbids user
+ *                            namespaces we degrade gracefully to layers 2–5.
+ *   2. no credentials      — environment stripped to a POSIX-minimal allowlist
+ *                            (NOT inherited from the ARC Lab server process).
+ *   3. resource limits     — RLIMIT_CPU/AS/NPROC/FSIZE applied by the runner
+ *                            preamble before any notebook cell runs.
+ *   4. wall clock + output — Node-side execFile timeout + maxBuffer cap.
+ *   5. throwaway cwd       — per-run mkdtemp directory, deleted afterwards.
+ */
+let unshareAvailable: boolean | null = null;
+
+function probeUnshare(): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile('unshare', ['-rn', 'true'], { timeout: 5_000 }, (err) => resolve(!err));
+  });
+}
+
+function sandboxEnv(cwd: string): NodeJS.ProcessEnv {
+  return {
+    PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    LANG: 'C.UTF-8',
+    LC_ALL: 'C.UTF-8',
+    PYTHONUNBUFFERED: '1',
+    PYTHONDONTWRITEBYTECODE: '1',
+    HOME: cwd,
+    TMPDIR: cwd,
+  };
+}
+
+async function runPython(script: string, args: string[], cwd: string, timeoutMs: number): Promise<{ stdout: string; error?: string }> {
+  if (unshareAvailable === null) unshareAvailable = await probeUnshare();
+  const bin = unshareAvailable ? 'unshare' : 'python3';
+  const argv = unshareAvailable ? ['-rn', 'python3', script, ...args] : [script, ...args];
   return new Promise((resolve) => {
     execFile(
-      'python3',
-      [script, ...args],
-      { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, PYTHONUNBUFFERED: '1' } },
+      bin,
+      argv,
+      { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, env: sandboxEnv(cwd) },
       (err, stdout) => {
         resolve({ stdout: typeof stdout === 'string' ? stdout : '', error: err ? `${err.message.slice(0, 200)}` : undefined });
       },
@@ -665,14 +724,14 @@ export async function runNotebookOnTask(opts: NotebookRunOptions): Promise<Noteb
     // ── execute cells
     steps.push({
       kind: 'think',
-      label: 'Executing notebook cells in a python3 sandbox…',
+      label: 'Executing notebook cells in an isolated python3 sandbox…',
       detail: analysis.needsGpu
         ? `Known heavy imports: ${analysis.heavyImports.slice(0, 5).join(', ')} — those cells are expected to fail here; later cells still get their chance.`
         : 'Capturing per-cell stdout and errors.',
     });
     const execScript = path.join(dir, 'arc_lab_nb_exec.py');
     const specFile = path.join(dir, 'arc_lab_nb_spec.json');
-    fs.writeFileSync(execScript, PY_EXEC_RUNNER);
+    fs.writeFileSync(execScript, `${PY_SANDBOX_PREAMBLE}\n${PY_EXEC_RUNNER}`);
     fs.writeFileSync(specFile, JSON.stringify({ cells: execCells, task: serializeTask(opts.train, opts.testInputs) }));
     const execRes = await runPython(execScript, [specFile], dir, EXEC_TIMEOUT_MS);
     pyExec = parseMarker<PyExecResult>(execRes.stdout) ?? {
@@ -770,7 +829,7 @@ Reply with ONLY the Python code, fenced as \`\`\`python ... \`\`\`.`;
         .map((p, i) => `Example ${i + 1}:\nINPUT: ${JSON.stringify(p.input)}\nOUTPUT: ${JSON.stringify(p.output)}`)
         .join('\n\n');
       const verifyScript = path.join(dir, 'arc_lab_verify.py');
-      fs.writeFileSync(verifyScript, PY_VERIFY_RUNNER);
+      fs.writeFileSync(verifyScript, `${PY_SANDBOX_PREAMBLE}\n${PY_VERIFY_RUNNER}`);
 
       const bestRef: { current: { code: string; fits: number; errors: string[]; attempts: Grid[][] } | null } = { current: null };
       const tryProgram = async (code: string): Promise<boolean> => {

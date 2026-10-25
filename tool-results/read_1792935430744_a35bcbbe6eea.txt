@@ -1,0 +1,930 @@
+     1→/**
+     2→ * ARC Lab — Notebook Agent engine (SERVER ONLY).
+     3→ *
+     4→ * Accepts a real Jupyter notebook (.ipynb) — e.g. acco-cyber/ARC-AGI-2's
+     5→ * `arc2-qwen-solo.ipynb` — and runs it against official ARC-AGI-2 puzzles:
+     6→ *
+     7→ *  1. ANALYZE   parse cells, imports, pip installs, %%writefile modules,
+     8→ *               solver entrypoints, GPU/heavy-dependency needs → a verdict.
+     9→ *  2. EXECUTE   run the code cells in a sandboxed python3 subprocess
+    10→ *               (shell magics skipped, per-cell stdout/errors captured),
+    11→ *               then probe the namespace for a solver entrypoint
+    12→ *               (solve / transform / predict / any 1-2 arg function) and
+    13→ *               test which call convention reproduces the demonstration pairs.
+    14→ *  3. FALLBACK  when the notebook needs GPU-only dependencies (vLLM, unsloth,
+    15→ *               torch…) and exposes no local entrypoint, run the notebook's own
+    16→ *               METHODOLOGY instead: verified program synthesis using the
+    17→ *               notebook's vendored helper toolkit (its %%writefile modules),
+    18→ *               with the LLM backend substituted for the notebook's model.
+    19→ *
+    20→ * Everything is honest: the exec log shows exactly which cells ran and which
+    21→ * failed, and the engine label states what actually executed.
+    22→ */
+    23→
+    24→import fs from 'fs';
+    25→import os from 'os';
+    26→import path from 'path';
+    27→import crypto from 'crypto';
+    28→import { execFile } from 'child_process';
+    29→import type { Grid } from '@/lib/arc/types';
+    30→import { llmChat } from '@/lib/server/llm';
+    31→
+    32→// ─────────────────────────────────────────────────────────── types
+    33→
+    34→export interface NotebookCellInfo {
+    35→  index: number;
+    36→  type: 'code' | 'markdown' | 'raw';
+    37→  lines: number;
+    38→  preview: string;
+    39→  writefile?: string;
+    40→  skippedLines: number;
+    41→}
+    42→
+    43→export interface NotebookAnalysis {
+    44→  title: string;
+    45→  kernel: string;
+    46→  nCode: number;
+    47→  nMarkdown: number;
+    48→  bytes: number;
+    49→  sha8: string;
+    50→  imports: string[];
+    51→  heavyImports: string[];
+    52→  missingImports: string[]; // imports we know are not available in this sandbox
+    53→  pipInstalls: string[];
+    54→  writefiles: Array<{ file: string; lines: number; safe: boolean; imports: string[] }>;
+    55→  entrypoints: string[];
+    56→  methodology: 'verified-program-synthesis' | 'direct-predict' | 'unknown';
+    57→  needsGpu: boolean;
+    58→  verdict: 'direct-run' | 'methodology' | 'analysis-only';
+    59→  verdictNote: string;
+    60→  cells: NotebookCellInfo[];
+    61→}
+    62→
+    63→export interface NotebookStep {
+    64→  kind: 'observe' | 'think' | 'verify' | 'act';
+    65→  label: string;
+    66→  detail?: string;
+    67→  code?: string;
+    68→  ok?: boolean;
+    69→}
+    70→
+    71→export interface ExecCellLog {
+    72→  cell: number;
+    73→  ok: boolean;
+    74→  stdout?: string;
+    75→  error?: string;
+    76→  trace?: string[];
+    77→}
+    78→
+    79→export interface NotebookSolveResult {
+    80→  ok: boolean;
+    81→  attempts: Grid[][];
+    82→  steps: NotebookStep[];
+    83→  analysis: NotebookAnalysis;
+    84→  execLog: ExecCellLog[];
+    85→  entrypoint?: string;
+    86→  convention?: string;
+    87→  fitReport?: string[];
+    88→  program?: string;
+    89→  engine: string;
+    90→  note?: string;
+    91→  error?: string;
+    92→  elapsedMs: number;
+    93→}
+    94→
+    95→interface RawCell {
+    96→  cell_type?: string;
+    97→  source?: string | string[];
+    98→}
+    99→
+   100→// ─────────────────────────────────────────────────────────── constants
+   101→
+   102→const HEAVY_MODULES = new Set([
+   103→  'torch', 'torchvision', 'vllm', 'unsloth', 'transformers', 'peft', 'trl', 'bitsandbytes',
+   104→  'flash_attn', 'accelerate', 'datasets', 'xformers', 'deepspeed', 'sentencepiece', 'tiktoken',
+   105→  'jax', 'cupy', 'numba', 'ray', 'wandb', 'openai',
+   106→]);
+   107→
+   108→const AVAILABLE_MODULES = new Set([
+   109→  // python stdlib (common subset)
+   110→  'json', 'sys', 'os', 're', 'math', 'itertools', 'collections', 'functools', 'time', 'io',
+   111→  'contextlib', 'traceback', 'inspect', 'random', 'glob', 'shutil', 'subprocess', 'datetime',
+   112→  'typing', 'pickle', 'bz2', 'gzip', 'hashlib', 'copy', 'abc', 'enum', 'dataclasses', 'pathlib',
+   113→  'statistics', 'string', 'warnings', 'multiprocessing', 'argparse', 'textwrap', 'unicodedata',
+   114→  'zlib', 'tempfile', 'threading', 'queue', 'base64', 'struct', 'operator', 'pprint', 'types',
+   115→  'timeit', 'uuid', 'csv', 'heapq', 'bisect', 'array', 'weakref', 'secrets', 'errno',
+   116→  '__future__', 'ast', 'asyncio', 'signal', 'gc', 'platform', 'site', 'code', 'codeop',
+   117→  // available in this sandbox
+   118→  'numpy', 'np', 'scipy',
+   119→]);
+   120→
+   121→const PREFERRED_ENTRYPOINTS = ['solve', 'transform', 'predict', 'infer', 'solver', 'run', 'main'];
+   122→
+   123→const MAX_NOTEBOOK_BYTES = 5 * 1024 * 1024;
+   124→const EXEC_TIMEOUT_MS = 75_000;
+   125→const VERIFY_TIMEOUT_MS = 30_000;
+   126→
+   127→// ─────────────────────────────────────────────────────────── parsing helpers
+   128→
+   129→function cellSource(c: RawCell): string {
+   130→  const s = c.source;
+   131→  if (Array.isArray(s)) return s.join('');
+   132→  return typeof s === 'string' ? s : '';
+   133→}
+   134→
+   135→function scanImports(src: string): string[] {
+   136→  const mods = new Set<string>();
+   137→  const re = /^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)/gm;
+   138→  let m: RegExpExecArray | null;
+   139→  while ((m = re.exec(src))) mods.add(m[1]);
+   140→  return [...mods];
+   141→}
+   142→
+   143→function extractTitle(nb: { cells?: RawCell[] }): string {
+   144→  for (const c of nb.cells ?? []) {
+   145→    if (c.cell_type !== 'markdown') continue;
+   146→    const m = cellSource(c).match(/^#\s+(.+)$/m);
+   147→    if (m) return m[1].trim().slice(0, 120);
+   148→  }
+   149→  return 'Untitled notebook';
+   150→}
+   151→
+   152→function extractHelperSignatures(src: string, max = 28): string {
+   153→  const lines = src.split('\n');
+   154→  const out: string[] = [];
+   155→  for (let i = 0; i < lines.length && out.length < max; i++) {
+   156→    const m = lines[i].match(/^def\s+([A-Za-z_]\w*)\s*\(([^)]*)\)/);
+   157→    if (!m) continue;
+   158→    let doc = '';
+   159→    for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+   160→      const t = lines[j].trim();
+   161→      const d = t.match(/^("""|''')(.*?)(?:\1|$)/);
+   162→      if (d && d[2]) {
+   163→        doc = d[2].slice(0, 90);
+   164→        break;
+   165→      }
+   166→      if (t && !t.startsWith('#') && !t.startsWith('"') && !t.startsWith("'")) break;
+   167→    }
+   168→    out.push(`def ${m[1]}(${m[2]}):${doc ? `  # ${doc}` : ''}`);
+   169→  }
+   170→  return out.join('\n');
+   171→}
+   172→
+   173→// ─────────────────────────────────────────────────────────── analysis
+   174→
+   175→export function analyzeNotebook(rawJson: string): NotebookAnalysis {
+   176→  const nb = JSON.parse(rawJson) as { cells?: RawCell[]; metadata?: { kernelspec?: { display_name?: string; name?: string } } };
+   177→  const cells = nb.cells ?? [];
+   178→  const codeCells: string[] = [];
+   179→  const cellInfos: NotebookCellInfo[] = [];
+   180→  const imports = new Set<string>();
+   181→  const pip = new Set<string>();
+   182→  const entrypoints = new Set<string>();
+   183→  const writefiles: NotebookAnalysis['writefiles'] = [];
+   184→  let shellLines = 0;
+   185→
+   186→  cells.forEach((c, index) => {
+   187→    const type = (c.cell_type === 'markdown' ? 'markdown' : c.cell_type === 'raw' ? 'raw' : 'code') as NotebookCellInfo['type'];
+   188→    const src = cellSource(c);
+   189→    let writefile: string | undefined;
+   190→    let skipped = 0;
+   191→
+   192→    if (type === 'code') {
+   193→      const lines = src.split('\n');
+   194→      const kept: string[] = [];
+   195→      let i = 0;
+   196→      if (lines[0]?.startsWith('%%')) {
+   197→        const magic = lines[0];
+   198→        if (magic.startsWith('%%writefile')) {
+   199→          writefile = magic.replace('%%writefile', '').trim();
+   200→        }
+   201→        i = 1; // skip the magic line either way
+   202→        skipped++;
+   203→      }
+   204→      for (; i < lines.length; i++) {
+   205→        const line = lines[i];
+   206→        if (/^\s*!/.test(line) || /^\s*%/.test(line)) {
+   207→          skipped++;
+   208→          const pm = line.match(/install(?:\s+--[\w-]+)*\s+(.+)$/);
+   209→          if (pm) pm[1].split(/\s+/).filter((p) => /^[\w.\-[\]]+$/.test(p)).forEach((p) => pip.add(p));
+   210→          continue;
+   211→        }
+   212→        const sm = line.match(/^\s*os\.system\(\s*['"]pip\s+install\s+(.+?)['"]/);
+   213→        if (sm) {
+   214→          skipped++;
+   215→          sm[1].split(/\s+/).forEach((p) => pip.add(p));
+   216→          continue;
+   217→        }
+   218→        kept.push(line);
+   219→      }
+   220→      const clean = kept.join('\n');
+   221→      codeCells.push(clean);
+   222→      for (const im of scanImports(clean)) imports.add(im);
+   223→      for (const n of PREFERRED_ENTRYPOINTS) {
+   224→        // only scan cells that will actually execute — module bodies written via
+   225→        // %%writefile never run as notebook code, so their defs are not entrypoints
+   226→        if (!writefile && new RegExp(`^\\s*def\\s+${n}\\s*\\(`, 'm').test(clean)) entrypoints.add(n);
+   227→      }
+   228→      if (writefile) {
+   229→        const wfImports = scanImports(src);
+   230→        const heavy = wfImports.some((m) => HEAVY_MODULES.has(m));
+   231→        const missingDep = wfImports.some((m) => !AVAILABLE_MODULES.has(m) && !HEAVY_MODULES.has(m));
+   232→        writefiles.push({ file: writefile, lines: src.split('\n').length, safe: !heavy && !missingDep, imports: wfImports });
+   233→      }
+   234→    }
+   235→
+   236→    cellInfos.push({
+   237→      index,
+   238→      type,
+   239→      lines: src ? src.split('\n').length : 0,
+   240→      preview: (type === 'markdown' ? cellSource(c) : src).replace(/^%%.*$/m, '').trim().slice(0, 160) || `(${type} cell)`,
+   241→      writefile,
+   242→      skippedLines: skipped,
+   243→    });
+   244→  });
+   245→
+   246→  const importList = [...imports].sort();
+   247→  const heavy = importList.filter((m) => HEAVY_MODULES.has(m));
+   248→  const missing = importList.filter((m) => !AVAILABLE_MODULES.has(m) && !HEAVY_MODULES.has(m));
+   249→
+   250→  // methodology detection
+   251→  const allSrc = codeCells.join('\n') + '\n' + writefiles.map((w) => w.file).join('\n');
+   252→  const mdCells = cells.filter((c) => c.cell_type === 'markdown').map((c) => cellSource(c)).join('\n');
+   253→  const hay = (allSrc + '\n' + mdCells).toLowerCase();
+   254→  let methodology: NotebookAnalysis['methodology'] = 'unknown';
+   255→  if (/def\s+transform\s*\(/.test(allSrc) || (hay.includes('verif') && (hay.includes('program') || hay.includes('transform')))) {
+   256→    methodology = 'verified-program-synthesis';
+   257→  } else if (hay.includes('output grid') || hay.includes('test input')) {
+   258→    methodology = 'direct-predict';
+   259→  }
+   260→
+   261→  const needsGpu = heavy.length > 0;
+   262→  let verdict: NotebookAnalysis['verdict'] = 'analysis-only';
+   263→  let verdictNote = '';
+   264→  if (entrypoints.size > 0) {
+   265→    verdict = 'direct-run';
+   266→    verdictNote = `Defines its own entrypoint(s): ${[...entrypoints].join(', ')}. ARC Lab will execute the cells and call the entrypoint on the puzzle directly.`;
+   267→  } else if (methodology === 'verified-program-synthesis') {
+   268→    verdict = 'methodology';
+   269→    verdictNote = needsGpu
+   270→      ? `No local solver entrypoint and it needs GPU-only deps (${heavy.slice(0, 3).join(', ')}…), so end-to-end vLLM serving is impossible in this sandbox. ARC Lab will run the notebook's own pipeline — verified program synthesis with its vendored helper toolkit — with the LLM backend substituted for its model.`
+   271→      : 'No single entrypoint found; ARC Lab will replay its program-synthesis pipeline with an LLM backend.';
+   272→  } else {
+   273→    verdictNote = needsGpu
+   274→      ? `Requires GPU-only dependencies (${heavy.slice(0, 3).join(', ')}). Cells will be executed for the record; anything that needs them will fail visibly, and ARC Lab will fall back to LLM direct prediction.`
+   275→      : 'ARC Lab will execute the cells and fall back to LLM direct prediction if no solver entrypoint emerges.';
+   276→  }
+   277→
+   278→  const sha8 = crypto.createHash('sha256').update(rawJson).digest('hex').slice(0, 8);
+   279→
+   280→  return {
+   281→    title: extractTitle(nb),
+   282→    kernel: nb.metadata?.kernelspec?.display_name ?? nb.metadata?.kernelspec?.name ?? 'python3',
+   283→    nCode: cellInfos.filter((c) => c.type === 'code').length,
+   284→    nMarkdown: cellInfos.filter((c) => c.type === 'markdown').length,
+   285→    bytes: Buffer.byteLength(rawJson),
+   286→    sha8,
+   287→    imports: importList,
+   288→    heavyImports: heavy,
+   289→    missingImports: missing,
+   290→    pipInstalls: [...pip].slice(0, 20),
+   291→    writefiles,
+   292→    entrypoints: [...entrypoints],
+   293→    methodology,
+   294→    needsGpu,
+   295→    verdict,
+   296→    verdictNote,
+   297→    cells: cellInfos,
+   298→  };
+   299→}
+   300→
+   301→// ─────────────────────────────────────────────────────────── notebook fetch
+   302→
+   303→const ALLOWED_FETCH_HOSTS = new Set([
+   304→  'github.com', 'raw.githubusercontent.com', 'gist.githubusercontent.com', 'huggingface.co',
+   305→  'arcprize.org', 'www.arcprize.org',
+   306→]);
+   307→
+   308→export function normalizeNotebookUrl(url: string): string | null {
+   309→  try {
+   310→    const u = new URL(url);
+   311→    if (u.protocol !== 'https:' || !ALLOWED_FETCH_HOSTS.has(u.hostname)) return null;
+   312→    const gh = u.pathname.match(/^\/([\w.-]+)\/([\w.-]+)\/blob\/(.+)$/);
+   313→    if (u.hostname === 'github.com' && gh) {
+   314→      return `https://raw.githubusercontent.com/${gh[1]}/${gh[2]}/${gh[3]}`;
+   315→    }
+   316→    return u.toString();
+   317→  } catch {
+   318→    return null;
+   319→  }
+   320→}
+   321→
+   322→export async function fetchNotebook(url: string): Promise<string> {
+   323→  const normalized = normalizeNotebookUrl(url);
+   324→  if (!normalized) throw new Error('Only https URLs from github.com / raw.githubusercontent.com / gist / huggingface.co / arcprize.org are allowed.');
+   325→  const ctrl = new AbortController();
+   326→  const timer = setTimeout(() => ctrl.abort(), 25_000);
+   327→  try {
+   328→    const res = await fetch(normalized, { signal: ctrl.signal });
+   329→    if (!res.ok) throw new Error(`Fetch failed: HTTP ${res.status} for ${normalized}`);
+   330→    const text = await res.text();
+   331→    if (text.length > MAX_NOTEBOOK_BYTES) throw new Error(`Notebook too large (${(text.length / 1024 / 1024).toFixed(1)} MB, limit 5 MB).`);
+   332→    if (text[0] === '<') throw new Error('URL returned HTML, not a notebook. Use a raw .ipynb URL.');
+   333→    return text;
+   334→  } finally {
+   335→    clearTimeout(timer);
+   336→  }
+   337→}
+   338→
+   339→export function notebookAgentId(rawJson: string): string {
+   340→  return `nb-${crypto.createHash('sha256').update(rawJson).digest('hex').slice(0, 8)}`;
+   341→}
+   342→
+   343→// ─────────────────────────────────────────────────────────── python runner
+   344→
+   345→const PY_EXEC_RUNNER = String.raw`
+   346→import json, sys, io, os, contextlib, traceback, inspect, types
+   347→
+   348→def main():
+   349→    spec = json.load(open(sys.argv[1]))
+   350→    cells = spec.get('cells', [])
+   351→    task = spec.get('task', {})
+   352→    sys.path.insert(0, os.getcwd())
+   353→    ns = {'__name__': '__notebook__'}
+   354→    log = []
+   355→    for i, src in enumerate(cells):
+   356→        entry = {'cell': i, 'ok': True, 'stdout': ''}
+   357→        buf = io.StringIO()
+   358→        try:
+   359→            with contextlib.redirect_stdout(buf):
+   360→                exec(compile(src, '<notebook cell %d>' % i, 'exec'), ns)
+   361→        except Exception as e:
+   362→            entry['ok'] = False
+   363→            entry['error'] = '%s: %s' % (type(e).__name__, str(e)[:300])
+   364→            tb = traceback.format_exc().strip().splitlines()
+   365→            entry['trace'] = tb[-2:]
+   366→        entry['stdout'] = buf.getvalue()[:2500]
+   367→        log.append(entry)
+   368→
+   369→    result = {'log': log, 'entrypoint': None, 'convention': None,
+   370→              'fitReport': [], 'attempts': [], 'error': None}
+   371→
+   372→    def as_grid(x):
+   373→        try:
+   374→            if hasattr(x, 'tolist'):
+   375→                x = x.tolist()
+   376→            if not isinstance(x, list) or not x or len(x) > 200:
+   377→                return None
+   378→            rows = []
+   379→            for row in x:
+   380→                if not isinstance(row, (list, tuple)) or len(row) == 0 or len(row) > 200:
+   381→                    return None
+   382→                rows.append([int(c) for c in row])
+   383→            w = len(rows[0])
+   384→            if any(len(r) != w for r in rows):
+   385→                return None
+   386→            if any(c < 0 or c > 9 for r in rows for c in r):
+   387→                return None
+   388→            return rows
+   389→        except Exception:
+   390→            return None
+   391→
+   392→    train = task.get('train', [])
+   393→    tests = task.get('test', [])
+   394→
+   395→    fns = []
+   396→    for n in ['solve', 'transform', 'predict', 'infer', 'solver', 'run', 'main']:
+   397→        v = ns.get(n)
+   398→        if callable(v) and not inspect.isclass(v) and getattr(v, '__module__', '') not in ('builtins',):
+   399→            fns.append(n)
+   400→    for n, v in list(ns.items()):
+   401→        if n.startswith('_') or n in fns or n in ('main',):
+   402→            continue
+   403→        if isinstance(v, types.FunctionType) and v.__module__ == '__notebook__':
+   404→            try:
+   405→                k = len(inspect.signature(v).parameters)
+   406→                if 1 <= k <= 2:
+   407→                    fns.append(n)
+   408→            except Exception:
+   409→                pass
+   410→    fns = fns[:40]
+   411→
+   412→    def conventions_for(fn):
+   413→        convs = []
+   414→        try:
+   415→            k = len(inspect.signature(fn).parameters)
+   416→        except Exception:
+   417→            k = 2
+   418→        if k >= 2:
+   419→            convs.append(('fn(train, grid)', lambda g: fn(train, g)))
+   420→            convs.append(('fn({"train": train}, grid)', lambda g: fn({'train': train}, g)))
+   421→        if k >= 1:
+   422→            convs.append(('fn(grid)', lambda g: fn(g)))
+   423→        return convs
+   424→
+   425→    best = None
+   426→    for name in fns:
+   427→        fn = ns[name]
+   428→        for conv_name, call in conventions_for(fn):
+   429→            fits = 0
+   430→            errs = []
+   431→            for p in train:
+   432→                try:
+   433→                    out = as_grid(call(p['input']))
+   434→                    if out is not None and p.get('output') is not None and out == p['output']:
+   435→                        fits += 1
+   436→                    else:
+   437→                        errs.append('%s/%s: demo %d mismatch' % (name, conv_name, len(errs) + 1))
+   438→                except Exception as e:
+   439→                    errs.append('%s/%s: %s: %s' % (name, conv_name, type(e).__name__, str(e)[:100]))
+   440→            score = (fits, -len(errs))
+   441→            if best is None or score > best['score']:
+   442→                best = {'name': name, 'conv': conv_name, 'score': score, 'fits': fits, 'errs': errs[:4]}
+   443→
+   444→    if best and best['fits'] > 0:
+   445→        result['entrypoint'] = best['name']
+   446→        result['convention'] = best['conv']
+   447→        result['fitReport'] = ['%d/%d demonstration pairs reproduced' % (best['fits'], len(train))] + best['errs']
+   448→        fn = ns[best['name']]
+   449→        for conv_name, call in conventions_for(fn):
+   450→            if conv_name == best['conv']:
+   451→                for t in tests:
+   452→                    try:
+   453→                        out = as_grid(call(t['input']))
+   454→                        result['attempts'].append([out] if out is not None else [])
+   455→                    except Exception as e:
+   456→                        result['attempts'].append([])
+   457→                        result['error'] = 'test call failed: %s: %s' % (type(e).__name__, str(e)[:160])
+   458→                break
+   459→
+   460→    sys.stdout.write('__ARC_LAB_RESULT__' + json.dumps(result))
+   461→
+   462→try:
+   463→    main()
+   464→except Exception as e:
+   465→    sys.stdout.write('__ARC_LAB_RESULT__' + json.dumps({'log': [], 'entrypoint': None, 'attempts': [], 'error': 'runner: %s' % str(e)[:200]}))
+   466→`;
+   467→
+   468→const PY_VERIFY_RUNNER = String.raw`
+   469→import json, sys, os
+   470→
+   471→def main():
+   472→    spec = json.load(open(sys.argv[1]))
+   473→    sys.path.insert(0, os.getcwd())
+   474→    ns = {}
+   475→    out = {'fits': 0, 'total': len(spec.get('train', [])), 'errors': [], 'attempts': [], 'entry': None}
+   476→    try:
+   477→        exec(compile(spec['program'], 'llm_program.py', 'exec'), ns)
+   478→    except Exception as e:
+   479→        out['errors'].append('program failed to load: %s: %s' % (type(e).__name__, str(e)[:220]))
+   480→        sys.stdout.write('__ARC_LAB_RESULT__' + json.dumps(out))
+   481→        return
+   482→    fn = None
+   483→    for n in ['transform', 'solve', 'predict', 'infer']:
+   484→        if callable(ns.get(n)):
+   485→            fn = ns[n]
+   486→            out['entry'] = n
+   487→            break
+   488→    if fn is None:
+   489→        out['errors'].append('no transform(grid) function found in the program')
+   490→        sys.stdout.write('__ARC_LAB_RESULT__' + json.dumps(out))
+   491→        return
+   492→
+   493→    def as_grid(x):
+   494→        try:
+   495→            if hasattr(x, 'tolist'):
+   496→                x = x.tolist()
+   497→            if not isinstance(x, list) or not x or len(x) > 200:
+   498→                return None
+   499→            rows = []
+   500→            for row in x:
+   501→                if not isinstance(row, (list, tuple)) or len(row) == 0 or len(row) > 200:
+   502→                    return None
+   503→                rows.append([int(c) for c in row])
+   504→            w = len(rows[0])
+   505→            if any(len(r) != w for r in rows):
+   506→                return None
+   507→            if any(c < 0 or c > 9 for r in rows for c in r):
+   508→                return None
+   509→            return rows
+   510→        except Exception:
+   511→            return None
+   512→
+   513→    for i, p in enumerate(spec.get('train', [])):
+   514→        try:
+   515→            g = as_grid(fn(p['input']))
+   516→            exp = p.get('output')
+   517→            if g is not None and exp is not None and g == exp:
+   518→                out['fits'] += 1
+   519→            else:
+   520→                got = ('%dx%d' % (len(g), len(g[0]))) if g else 'invalid'
+   521→                exps = ('%dx%d' % (len(exp), len(exp[0]))) if exp else '?'
+   522→                out['errors'].append('demo %d: got %s, expected %s' % (i + 1, got, exps))
+   523→        except Exception as e:
+   524→            out['errors'].append('demo %d: %s: %s' % (i + 1, type(e).__name__, str(e)[:140]))
+   525→    if out['fits'] == out['total'] and out['total'] > 0:
+   526→        for t in spec.get('test', []):
+   527→            try:
+   528→                g = as_grid(fn(t['input']))
+   529→                out['attempts'].append([g] if g is not None else [])
+   530→            except Exception as e:
+   531→                out['attempts'].append([])
+   532→                out['errors'].append('test call: %s: %s' % (type(e).__name__, str(e)[:140]))
+   533→    sys.stdout.write('__ARC_LAB_RESULT__' + json.dumps(out))
+   534→
+   535→try:
+   536→    main()
+   537→except Exception as e:
+   538→    sys.stdout.write('__ARC_LAB_RESULT__' + json.dumps({'fits': 0, 'total': 0, 'errors': ['runner: %s' % str(e)[:200]], 'attempts': [], 'entry': None}))
+   539→`;
+   540→
+   541→interface PyExecResult {
+   542→  log: ExecCellLog[];
+   543→  entrypoint: string | null;
+   544→  convention: string | null;
+   545→  fitReport: string[];
+   546→  attempts: Grid[][];
+   547→  error: string | null;
+   548→}
+   549→
+   550→interface PyVerifyResult {
+   551→  fits: number;
+   552→  total: number;
+   553→  errors: string[];
+   554→  attempts: Grid[][];
+   555→  entry: string | null;
+   556→}
+   557→
+   558→function runPython(script: string, args: string[], cwd: string, timeoutMs: number): Promise<{ stdout: string; error?: string }> {
+   559→  return new Promise((resolve) => {
+   560→    execFile(
+   561→      'python3',
+   562→      [script, ...args],
+   563→      { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, PYTHONUNBUFFERED: '1' } },
+   564→      (err, stdout) => {
+   565→        resolve({ stdout: typeof stdout === 'string' ? stdout : '', error: err ? `${err.message.slice(0, 200)}` : undefined });
+   566→      },
+   567→    );
+   568→  });
+   569→}
+   570→
+   571→function parseMarker<T>(stdout: string): T | null {
+   572→  const idx = stdout.lastIndexOf('__ARC_LAB_RESULT__');
+   573→  if (idx === -1) return null;
+   574→  try {
+   575→    return JSON.parse(stdout.slice(idx + 18)) as T;
+   576→  } catch {
+   577→    return null;
+   578→  }
+   579→}
+   580→
+   581→// ─────────────────────────────────────────────────────────── task serialization
+   582→
+   583→interface SerializedTask {
+   584→  train: Array<{ input: Grid; output: Grid }>;
+   585→  test: Array<{ input: Grid }>;
+   586→}
+   587→
+   588→function serializeTask(train: Array<{ input: Grid; output?: Grid }>, testInputs: Grid[]): SerializedTask {
+   589→  return {
+   590→    train: train.filter((p) => p.output).map((p) => ({ input: p.input, output: p.output as Grid })),
+   591→    test: testInputs.map((input) => ({ input })),
+   592→  };
+   593→}
+   594→
+   595→// ─────────────────────────────────────────────────────────── main entry
+   596→
+   597→export interface NotebookRunOptions {
+   598→  train: Array<{ input: Grid; output?: Grid }>;
+   599→  testInputs: Grid[];
+   600→  rawNotebook: string;
+   601→  /** LLM knobs for the methodology / fallback path. */
+   602→  samples?: number;
+   603→  repairSamples?: number;
+   604→}
+   605→
+   606→export async function runNotebookOnTask(opts: NotebookRunOptions): Promise<NotebookSolveResult> {
+   607→  const t0 = Date.now();
+   608→  const analysis = analyzeNotebook(opts.rawNotebook);
+   609→  const nb = JSON.parse(opts.rawNotebook) as { cells?: RawCell[] };
+   610→  const steps: NotebookStep[] = [];
+   611→  const engineBase = `notebook "${analysis.title}"`;
+   612→
+   613→  steps.push({
+   614→    kind: 'observe',
+   615→    label: `Parsed notebook: ${analysis.title}`,
+   616→    detail: `${analysis.nCode} code + ${analysis.nMarkdown} markdown cells · kernel ${analysis.kernel} · ${(analysis.bytes / 1024).toFixed(0)} KB`,
+   617→  });
+   618→
+   619→  // ── prepare sandbox dir
+   620→  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arclab-nb-'));
+   621→  let pyExec: PyExecResult | null = null;
+   622→  try {
+   623→    // build cell payloads
+   624→    const execCells: string[] = [];
+   625→    const skipped: string[] = [];
+   626→    (nb.cells ?? []).forEach((c, i) => {
+   627→      if (c.cell_type !== 'code') return;
+   628→      const src = cellSource(c);
+   629→      const info = analysis.cells[i];
+   630→      if (info?.writefile) {
+   631→        const body = src.split('\n').slice(1).join('\n');
+   632→        const safeName = info.writefile.replace(/[^\w.-]/g, '_');
+   633→        try {
+   634→          fs.writeFileSync(path.join(dir, safeName), body);
+   635→          skipped.push(`cell ${i}: %%writefile ${safeName} → module staged (${body.split('\n').length} lines)`);
+   636→        } catch {
+   637→          skipped.push(`cell ${i}: %%writefile ${safeName} → could not stage`);
+   638→        }
+   639→        return;
+   640→      }
+   641→      const lines = src.split('\n');
+   642→      const kept = lines.filter((l) => !/^\s*!/.test(l) && !/^\s*%/.test(l));
+   643→      if (kept.length !== lines.length) skipped.push(`cell ${i}: ${lines.length - kept.length} shell/magic line(s) skipped`);
+   644→      if (kept.join('').trim()) execCells.push(kept.join('\n'));
+   645→    });
+   646→
+   647→    if (skipped.length) {
+   648→      steps.push({ kind: 'observe', label: 'Staged notebook artifacts', detail: skipped.slice(0, 8).join(' · ') });
+   649→    }
+   650→
+   651→    // stage safe helper modules for the methodology path
+   652→    const safeModules = analysis.writefiles.filter((w) => w.safe);
+   653→    for (const w of safeModules) {
+   654→      const cell = (nb.cells ?? []).find((c) => c.cell_type === 'code' && cellSource(c).startsWith(`%%writefile ${w.file}`));
+   655→      if (cell) {
+   656→        const body = cellSource(cell).split('\n').slice(1).join('\n');
+   657→        try {
+   658→          fs.writeFileSync(path.join(dir, w.file.replace(/[^\w.-]/g, '_')), body);
+   659→        } catch {
+   660→          /* ignore */
+   661→        }
+   662→      }
+   663→    }
+   664→
+   665→    // ── execute cells
+   666→    steps.push({
+   667→      kind: 'think',
+   668→      label: 'Executing notebook cells in a python3 sandbox…',
+   669→      detail: analysis.needsGpu
+   670→        ? `Known heavy imports: ${analysis.heavyImports.slice(0, 5).join(', ')} — those cells are expected to fail here; later cells still get their chance.`
+   671→        : 'Capturing per-cell stdout and errors.',
+   672→    });
+   673→    const execScript = path.join(dir, 'arc_lab_nb_exec.py');
+   674→    const specFile = path.join(dir, 'arc_lab_nb_spec.json');
+   675→    fs.writeFileSync(execScript, PY_EXEC_RUNNER);
+   676→    fs.writeFileSync(specFile, JSON.stringify({ cells: execCells, task: serializeTask(opts.train, opts.testInputs) }));
+   677→    const execRes = await runPython(execScript, [specFile], dir, EXEC_TIMEOUT_MS);
+   678→    pyExec = parseMarker<PyExecResult>(execRes.stdout) ?? {
+   679→      log: [],
+   680→      entrypoint: null,
+   681→      convention: null,
+   682→      fitReport: [],
+   683→      attempts: [],
+   684→      error: execRes.error ?? 'runner produced no result (timeout or crash)',
+   685→    };
+   686→    const okCells = pyExec.log.filter((l) => l.ok).length;
+   687→    const badCells = pyExec.log.filter((l) => !l.ok);
+   688→    steps.push({
+   689→      kind: 'verify',
+   690→      label: `Executed ${pyExec.log.length} code cells: ${okCells} ok, ${badCells.length} failed`,
+   691→      detail: badCells
+   692→        .slice(0, 4)
+   693→        .map((l) => `cell ${l.cell}: ${l.error}`)
+   694→        .join(' · ') || 'all cells clean',
+   695→      ok: badCells.length === 0,
+   696→    });
+   697→    if (pyExec.log.length === 0 && pyExec.error) {
+   698→      steps.push({ kind: 'verify', label: 'Sandbox execution aborted', detail: pyExec.error, ok: false });
+   699→    }
+   700→
+   701→    // ── entrypoint path
+   702→    if (pyExec.entrypoint && pyExec.attempts.some((a) => a.length > 0)) {
+   703→      steps.push({
+   704→        kind: 'verify',
+   705→        label: `Found solver entrypoint: ${pyExec.entrypoint}()`,
+   706→        detail: (pyExec.fitReport ?? []).join(' · ') || 'verified against the demonstration pairs',
+   707→        ok: true,
+   708→      });
+   709→      steps.push({ kind: 'act', label: `Ran ${pyExec.entrypoint}() on the test input(s) — pure local execution of the notebook's own code` });
+   710→      return {
+   711→        ok: true,
+   712→        attempts: pyExec.attempts,
+   713→        steps,
+   714→        analysis,
+   715→        execLog: pyExec.log,
+   716→        entrypoint: pyExec.entrypoint,
+   717→        convention: pyExec.convention ?? undefined,
+   718→        fitReport: pyExec.fitReport,
+   719→        engine: `${engineBase} — direct execution of ${pyExec.entrypoint}() (no LLM involved)`,
+   720→        elapsedMs: Date.now() - t0,
+   721→      };
+   722→    }
+   723→
+   724→    // ── methodology / fallback paths
+   725→    const K1 = Math.min(Math.max(opts.samples ?? 2, 1), 3);
+   726→    const K2 = Math.min(Math.max(opts.repairSamples ?? 1, 0), 2);
+   727→    let program: string | undefined;
+   728→    let attempts: Grid[][] = [];
+   729→
+   730→    if (analysis.methodology === 'verified-program-synthesis' && safeModules.length > 0) {
+   731→      // pick the best helper toolkit: prefer kit-like names, then the highest
+   732→      // def-density module (dense pure helpers beat long pipeline harnesses)
+   733→      const toolkit = safeModules.reduce((a, b) => {
+   734→        const kitName = (f: string) => /kit|toolkit|helper|librar/i.test(f);
+   735→        if (kitName(a.file) !== kitName(b.file)) return kitName(a.file) ? a : b;
+   736→        const density = (f: { file: string; lines: number }) => {
+   737→          const cell = (nb.cells ?? []).find((c) => c.cell_type === 'code' && cellSource(c).startsWith(`%%writefile ${f.file}`));
+   738→          const body = cell ? cellSource(cell) : '';
+   739→          const defs = (body.match(/^def\s+/gm) ?? []).length;
+   740→          return defs / Math.max(1, f.lines);
+   741→        };
+   742→        return density(a) >= density(b) ? a : b;
+   743→      });
+   744→      const sigs = extractHelperSignatures(
+   745→        fs.existsSync(path.join(dir, toolkit.file.replace(/[^\w.-]/g, '_')))
+   746→          ? fs.readFileSync(path.join(dir, toolkit.file.replace(/[^\w.-]/g, '_')), 'utf8')
+   747→          : '',
+   748→      );
+   749→      steps.push({
+   750→        kind: 'think',
+   751→        label: `No callable entrypoint — running the notebook's own methodology: verified program synthesis`,
+   752→        detail: `Using its vendored toolkit ${toolkit.file} (${toolkit.lines} lines) as the helper library; the LLM backend stands in for the notebook's GPU model.`,
+   753→      });
+   754→
+   755→      const modName = toolkit.file.replace(/\.py$/, '').replace(/[^\w.]/g, '');
+   756→      const SYSTEM = `You are replicating the program-synthesis stage of a real ARC-AGI-2 notebook (${analysis.title}).
+   757→Write a Python function \`def transform(grid):\` that maps an input grid (list of lists of ints 0-9) to the output grid, reproducing EVERY example pair EXACTLY.
+   758→The notebook's own helper toolkit is importable: \`from ${modName} import *\`. Available helpers (signatures):
+   759→${sigs || '(toolkit signatures unavailable — use plain numpy)'}
+   760→
+   761→Rules:
+   762→- numpy is available as np. Pure function, no file I/O, no input(), no while True without exit.
+   763→- Derive the RULE from the examples; do not hardcode the answer grids.
+   764→- The function must return a list of lists of ints (or a numpy array).
+   765→Reply with ONLY the Python code, fenced as \`\`\`python ... \`\`\`.`;
+   766→
+   767→      const taskText = JSON.stringify(serializeTask(opts.train, opts.testInputs));
+   768→      const examples = opts.train
+   769→        .filter((p) => p.output)
+   770→        .map((p, i) => `Example ${i + 1}:\nINPUT: ${JSON.stringify(p.input)}\nOUTPUT: ${JSON.stringify(p.output)}`)
+   771→        .join('\n\n');
+   772→      const verifyScript = path.join(dir, 'arc_lab_verify.py');
+   773→      fs.writeFileSync(verifyScript, PY_VERIFY_RUNNER);
+   774→
+   775→      const bestRef: { current: { code: string; fits: number; errors: string[]; attempts: Grid[][] } | null } = { current: null };
+   776→      const tryProgram = async (code: string): Promise<boolean> => {
+   777→        const specFile2 = path.join(dir, 'verify_spec.json');
+   778→        fs.writeFileSync(specFile2, JSON.stringify({ program: code, task: taskText, train: serializeTask(opts.train, opts.testInputs).train, test: serializeTask(opts.train, opts.testInputs).test }));
+   779→        const res = await runPython(verifyScript, [specFile2], dir, VERIFY_TIMEOUT_MS);
+   780→        const parsed = parseMarker<PyVerifyResult>(res.stdout);
+   781→        if (!parsed) {
+   782→          steps.push({ kind: 'verify', label: 'Program verification did not return (timeout or crash)', ok: false });
+   783→          return false;
+   784→        }
+   785→        steps.push({
+   786→          kind: 'verify',
+   787→          label: `Program: reproduced ${parsed.fits}/${parsed.total} examples`,
+   788→          detail: parsed.errors.slice(0, 3).join(' · ') || 'fits every example',
+   789→          ok: parsed.fits === parsed.total && parsed.total > 0,
+   790→        });
+   791→        if (!bestRef.current || parsed.fits > bestRef.current.fits) bestRef.current = { code, fits: parsed.fits, errors: parsed.errors, attempts: parsed.attempts };
+   792→        return parsed.fits === parsed.total && parsed.total > 0 && parsed.attempts.length > 0;
+   793→      };
+   794→
+   795→      let solvedByProgram = false;
+   796→      for (let i = 0; i < K1 && !solvedByProgram; i++) {
+   797→        try {
+   798→          const text = await llmChat(SYSTEM, `${examples}\n\nWrite the Python transform(grid) program (function definition only).`);
+   799→          const code = extractPython(text);
+   800→          if (!code) {
+   801→            steps.push({ kind: 'verify', label: `Candidate ${i + 1}: unparsable reply`, ok: false });
+   802→            continue;
+   803→          }
+   804→          steps.push({ kind: 'think', label: `Candidate program ${i + 1} written by the LLM backend`, code: code.slice(0, 700) });
+   805→          solvedByProgram = await tryProgram(code);
+   806→        } catch (err) {
+   807→          steps.push({ kind: 'verify', label: `Candidate ${i + 1}: LLM error`, detail: err instanceof Error ? err.message : 'error', ok: false });
+   808→        }
+   809→      }
+   810→      const bestForRepair = bestRef.current;
+   811→      if (!solvedByProgram && bestForRepair) {
+   812→        for (let i = 0; i < K2 && !solvedByProgram; i++) {
+   813→          try {
+   814→            const repair = `${examples}\n\nThis Python program is WRONG:\n\`\`\`python\n${bestForRepair.code}\n\`\`\`\nIts verification errors: ${bestForRepair.errors.slice(0, 3).join('; ')}.\nRewrite it so transform(grid) reproduces EVERY example exactly. Same contract, reply with only the corrected code.`;
+   815→            const text = await llmChat(SYSTEM, repair);
+   816→            const code = extractPython(text);
+   817→            if (!code) continue;
+   818→            steps.push({ kind: 'think', label: `Repair round ${i + 1}`, code: code.slice(0, 700) });
+   819→            solvedByProgram = await tryProgram(code);
+   820→          } catch (err) {
+   821→            steps.push({ kind: 'verify', label: `Repair ${i + 1}: LLM error`, detail: err instanceof Error ? err.message : 'error', ok: false });
+   822→          }
+   823→        }
+   824→      }
+   825→      const bestFinal = bestRef.current;
+   826→      if (solvedByProgram && bestFinal) {
+   827→        program = bestFinal.code;
+   828→        attempts = bestFinal.attempts;
+   829→        steps.push({ kind: 'act', label: 'Verified program applied to the test input(s) — the notebook methodology, executed with local substitutes' });
+   830→        return {
+   831→          ok: true,
+   832→          attempts,
+   833→          steps,
+   834→          analysis,
+   835→          execLog: pyExec.log,
+   836→          program,
+   837→          engine: `${engineBase} — methodology mode: verified program synthesis with its own toolkit, LLM backend substituted for the GPU model`,
+   838→          note: 'The notebook needs GPU-only dependencies, so its model backend was substituted; the verify-on-demos discipline is the notebook\'s own.',
+   839→          elapsedMs: Date.now() - t0,
+   840→        };
+   841→      }
+   842→      const bestAny = bestRef.current;
+   843→      if (bestAny) {
+   844→        steps.push({ kind: 'think', label: 'No program fits all examples — falling back to direct grid prediction', detail: `best program reproduced ${bestAny.fits} of ${opts.train.filter((p) => p.output).length} examples` });
+   845→      }
+   846→    }
+   847→
+   848→    // ── LLM direct fallback
+   849→    const DIRECT_SYSTEM = `You are an ARC-AGI-2 solver. Given example input/output grid pairs, infer the transformation and output the test grid.
+   850→Grids are rectangular arrays of integers 0-9. The output may differ in size from the input.
+   851→Reply with ONLY the output grid as a JSON array of arrays. No markdown, no commentary.`;
+   852→    const examples = opts.train
+   853→      .filter((p) => p.output)
+   854→      .map((p, i) => `Example ${i + 1}:\nINPUT: ${JSON.stringify(p.input)}\nOUTPUT: ${JSON.stringify(p.output)}`)
+   855→      .join('\n\n');
+   856→    const directAttempts: Grid[][] = [];
+   857→    let llmError = '';
+   858→    for (const ti of opts.testInputs) {
+   859→      const preds: Grid[] = [];
+   860→      for (let i = 0; i < 2 && preds.length < 2; i++) {
+   861→        try {
+   862→          const text = await llmChat(
+   863→            DIRECT_SYSTEM,
+   864→            `${examples}\n\nNotebook context: ${analysis.title} (${analysis.methodology}).\n\nTest INPUT: ${JSON.stringify(ti)}\n\nWhat is the Test OUTPUT? Reply with ONLY the output grid as JSON.`,
+   865→          );
+   866→          const g = parseGridLoose(text);
+   867→          if (g && !preds.some((p) => JSON.stringify(p) === JSON.stringify(g))) preds.push(g);
+   868→        } catch (err) {
+   869→          llmError = err instanceof Error ? err.message : 'llm-error';
+   870→        }
+   871→      }
+   872→      directAttempts.push(preds.length > 0 ? preds : [ti.map((r) => [...r])]);
+   873→    }
+   874→    if (directAttempts.some((a) => a.length > 0)) {
+   875→      steps.push({ kind: 'act', label: 'Direct fallback produced candidate grids (unverified — no program evidence)', ok: false });
+   876→    } else {
+   877→      steps.push({ kind: 'act', label: 'No prediction could be produced', detail: llmError || 'LLM unavailable', ok: false });
+   878→    }
+   879→    attempts = directAttempts;
+   880→    return {
+   881→      ok: attempts.some((a) => a.length > 0),
+   882→      attempts,
+   883→      steps,
+   884→      analysis,
+   885→      execLog: pyExec.log,
+   886→      program,
+   887→      engine: program ? `${engineBase} — methodology mode` : `${engineBase} — LLM direct fallback (notebook could not be executed locally)`,
+   888→      note: llmError ? `LLM note: ${llmError}` : undefined,
+   889→      elapsedMs: Date.now() - t0,
+   890→    };
+   891→  } finally {
+   892→    try {
+   893→      fs.rmSync(dir, { recursive: true, force: true });
+   894→    } catch {
+   895→      /* ignore */
+   896→    }
+   897→  }
+   898→}
+   899→
+   900→// ─────────────────────────────────────────────────────────── small helpers
+   901→
+   902→function extractPython(text: string): string | null {
+   903→  if (!text) return null;
+   904→  const fence = text.match(/```(?:python|py)?\s*([\s\S]*?)```/);
+   905→  const code = (fence ? fence[1] : text).trim();
+   906→  return /def\s+\w+\s*\(/.test(code) && code.length > 20 ? code : null;
+   907→}
+   908→
+   909→function parseGridLoose(text: string): Grid | null {
+   910→  if (!text) return null;
+   911→  const start = text.indexOf('[[');
+   912→  const end = text.lastIndexOf(']]');
+   913→  if (start === -1 || end === -1 || end <= start) return null;
+   914→  try {
+   915→    const parsed = JSON.parse(text.slice(start, end + 2)) as unknown;
+   916→    if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 200) return null;
+   917→    const w = Array.isArray(parsed[0]) ? (parsed[0] as unknown[]).length : -1;
+   918→    if (w <= 0 || w > 200) return null;
+   919→    for (const row of parsed as unknown[]) {
+   920→      if (!Array.isArray(row) || (row as unknown[]).length !== w) return null;
+   921→      for (const cell of row as unknown[]) {
+   922→        if (typeof cell !== 'number' || !Number.isInteger(cell) || cell < 0 || cell > 9) return null;
+   923→      }
+   924→    }
+   925→    return parsed as Grid;
+   926→  } catch {
+   927→    return null;
+   928→  }
+   929→}
+   930→
